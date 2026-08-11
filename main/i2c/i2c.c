@@ -32,7 +32,7 @@ static void forget_devices(void)
     dev_cache_count = 0;
 }
 
-static esp_err_t device_for_address(uint8_t address, i2c_master_dev_handle_t *out)
+esp_err_t i2c_device_handle(uint8_t address, i2c_master_dev_handle_t *out)
 {
     for (size_t i = 0; i < dev_cache_count; i++) {
         if (dev_cache[i].address == address) {
@@ -66,7 +66,7 @@ static esp_err_t device_for_address(uint8_t address, i2c_master_dev_handle_t *ou
     return ESP_OK;
 }
 
-static bool require_bus(void)
+bool i2c_require_bus(void)
 {
     if (!bus_handle) {
         bp_error("I2C not initialized. Run 'i2c bus <scl> <sda>' first.");
@@ -199,7 +199,7 @@ int cmd_i2c_scan(int argc, char **argv)
     (void)argc;
     (void)argv;
 
-    if (!require_bus()) {
+    if (!i2c_require_bus()) {
         return -1;
     }
 
@@ -251,7 +251,7 @@ int cmd_i2c_scan(int argc, char **argv)
 
 int cmd_i2c_read(int argc, char **argv)
 {
-    if (!require_bus()) {
+    if (!i2c_require_bus()) {
         return -1;
     }
 
@@ -273,7 +273,7 @@ int cmd_i2c_read(int argc, char **argv)
     }
 
     i2c_master_dev_handle_t dev = NULL;
-    esp_err_t err = device_for_address((uint8_t)address, &dev);
+    esp_err_t err = i2c_device_handle((uint8_t)address, &dev);
     if (err != ESP_OK) {
         bp_error("Addressing device 0x%02X: %s", address, esp_err_to_name(err));
         return -1;

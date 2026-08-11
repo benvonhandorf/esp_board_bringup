@@ -132,6 +132,85 @@ If any errors are present that prevent the bus from being properly scanned, such
 
 Reads the specified number of bytes from the specified address on the bus.  If the number of bytes are not specified, one byte is read.
 
+#### INA237
+
+Reached as `i2c ina237 ...`, or by entering the `i2c` menu and then `ina237`.
+Drives TI INA237 current/voltage/power monitors, which occupy addresses
+`0x40`–`0x4f` depending on how their A0/A1 pins are strapped. Several can be
+present on one bus, each with its own shunt resistor.
+
+The shunt input range is left at the device default of ±163.84 mV. Combined
+with the shunt resistance this fixes the current resolution: at the default
+0.004 Ω the device reads ±40.96 A at 1.25 mA per count.
+
+##### `config <address> [shunt_ohms]`
+
+Registers a monitor and programs its calibration. The shunt resistance defaults
+to **0.004 Ω**. Before accepting the device, `MANUFACTURER_ID` is read and must
+report `0x5449`, so a wrong address or a different chip is reported rather than
+silently producing plausible-looking numbers. Re-running on the same address
+updates it in place.
+
+Note that `MANUFACTURER_ID` is the only identification available: unlike the
+INA238 and INA228, the INA237 has no `DEVICE_ID` register, so this check
+confirms a TI part of this family but cannot distinguish the exact variant.
+
+##### `read [address]`
+
+Reads the measurement registers and reports bus voltage, current and power,
+along with shunt voltage and die temperature. With no address, every configured
+monitor is read. With an address that has not been configured, the monitor is
+registered on the spot using the default shunt.
+
+The `DIAG_ALRT` register is checked on every read: an arithmetic overflow
+(`MATHOF`) or a trim-memory checksum error (`MEMSTAT`) is reported, because
+either one means the reported values cannot be trusted. `SHUNT_CAL` is also
+read back, so a device that has reset since it was configured is flagged
+instead of reporting mis-scaled current.
+
+##### `list`
+
+Shows the configured monitors with their shunt resistance, current resolution
+and full-scale range.
+
+#### SHT4x
+
+Reached as `i2c sht4x ...`. Drives Sensirion SHT4x humidity and temperature
+sensors. The address is fixed by the part variant — `0x44` for the A variant
+(such as the SHT40-AD1B), `0x45` for B and `0x46` for C — so every command takes
+an optional address that defaults to **0x44**.
+
+Unlike the INA237 the SHT4x has no registers. A command byte is written, the
+sensor is given time to measure, and the result is read back in a separate
+transaction; reading too early makes the sensor NACK. Each 16-bit value carries
+its own CRC-8, which is checked on every read, so corrupted data is reported
+rather than converted into a plausible-looking measurement.
+
+##### `read [address] [high|medium|low]`
+
+Measures temperature and relative humidity, reporting both in engineering units
+along with the raw tick values. Repeatability defaults to `high`; lower settings
+are faster and noisier. Humidity is cropped to the physical 0–100 %RH range, and
+if cropping was necessary the uncropped value is shown too — during bringup a
+wildly out-of-range reading is a signal, not noise.
+
+##### `serial [address]`
+
+Reads the sensor's 32-bit serial number. The SHT4x has no ID register, so a
+serial number that reads back with valid CRCs is the available evidence that a
+real sensor is responding.
+
+##### `heater [address] <mW> <ms>`
+
+Pulses the on-die heater and then reports the measurement the sensor takes just
+before switching it off. Power is 20, 110 or 200 mW and duration is 100 or
+1000 ms; only those six combinations exist in the device. Useful for driving off
+condensation, and for confirming the part responds to a stimulus.
+
+##### `reset [address]`
+
+Issues a soft reset.
+
 ### UART
 
 This is an auxiliary UART, always separate from the console port, so

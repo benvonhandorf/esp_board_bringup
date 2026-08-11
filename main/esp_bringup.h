@@ -38,4 +38,11 @@ int parse_int_arg(const char *token, int *out);
  */
 int parse_num_arg(const char *token, int *out);
 
+/*
+ * Parse a whole token as a finite double, e.g. a shunt resistance of "0.004".
+ * Rejects trailing garbage, infinities and NaN. Returns 0 on success, -1
+ * otherwise.
+ */
+int parse_double_arg(const char *token, double *out);
+
 #endif

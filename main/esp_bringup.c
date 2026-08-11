@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <math.h>
 
 /* Guard rail so a typo like "0-100000" cannot exhaust the heap. */
 #define MAX_PINS 64
@@ -67,6 +68,39 @@ int parse_num_arg(const char *token, int *out)
     }
 
     return parse_in_base(token, 10, out);
+}
+
+int parse_double_arg(const char *token, double *out)
+{
+    if (!token) {
+        return -1;
+    }
+    while (*token == ' ') {
+        token++;
+    }
+    if (*token == '\0') {
+        return -1;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    double value = strtod(token, &end);
+
+    if (errno != 0 || end == token) {
+        return -1;
+    }
+    while (*end == ' ') {
+        end++;
+    }
+    if (*end != '\0') {
+        return -1; /* trailing garbage, e.g. "0.004ohm" */
+    }
+    if (!isfinite(value)) {
+        return -1;
+    }
+
+    *out = value;
+    return 0;
 }
 
 static int append_pin(int **pins, int *count, int pin)

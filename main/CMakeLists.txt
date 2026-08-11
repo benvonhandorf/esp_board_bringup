@@ -15,6 +15,8 @@ idf_component_register(
         "gpio/gpio.c"
         "gpio/pwm.c"
         "i2c/i2c.c"
+        "i2c/ina237.c"
+        "i2c/sht4x.c"
         "spi/spi.c"
         "system/system.c"
         "uart/uart.c"

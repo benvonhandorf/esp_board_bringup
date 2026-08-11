@@ -7,6 +7,8 @@
 #include "gpio.h"
 #include "pwm.h"
 #include "i2c.h"
+#include "ina237.h"
+#include "sht4x.h"
 #include "spi.h"
 #include "system.h"
 #include "uart.h"
@@ -63,10 +65,41 @@ static const bp_command_t i2c_commands[] = {
     {"read", "<address> [bytes]", "Read bytes from a device", cmd_i2c_read},
 };
 
+static const bp_command_t ina237_commands[] = {
+    {"config", "<address> [ohms]", "Register a monitor (shunt defaults to 0.004 ohm)", cmd_ina237_config},
+    {"read", "[address]", "Report bus voltage, current and power", cmd_ina237_read},
+    {"list", "", "Show configured monitors and their calibration", cmd_ina237_list},
+};
+
+static const bp_menu_t ina237_menu = {
+    .name = "ina237",
+    .help = "TI INA237 current/voltage/power monitors at 0x40-0x4f",
+    .commands = ina237_commands,
+    .command_count = ARRAY_COUNT(ina237_commands),
+};
+
+static const bp_command_t sht4x_commands[] = {
+    {"read", "[address] [high|medium|low]", "Measure temperature and humidity", cmd_sht4x_read},
+    {"serial", "[address]", "Read the sensor serial number", cmd_sht4x_serial},
+    {"heater", "[address] <mW> <ms>", "Pulse the heater, then measure", cmd_sht4x_heater},
+    {"reset", "[address]", "Soft-reset the sensor", cmd_sht4x_reset},
+};
+
+static const bp_menu_t sht4x_menu = {
+    .name = "sht4x",
+    .help = "Sensirion SHT4x humidity/temperature sensors at 0x44-0x46",
+    .commands = sht4x_commands,
+    .command_count = ARRAY_COUNT(sht4x_commands),
+};
+
+static const bp_menu_t *const i2c_submenus[] = {&ina237_menu, &sht4x_menu};
+
 static const bp_menu_t i2c_menu = {
     .name = "i2c",
     .help = "I2C master",
     .commands = i2c_commands,
+    .submenus = i2c_submenus,
+    .submenu_count = ARRAY_COUNT(i2c_submenus),
     .command_count = ARRAY_COUNT(i2c_commands),
 };
 
