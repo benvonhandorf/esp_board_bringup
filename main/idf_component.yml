@@ -1,0 +1,5 @@
+dependencies:
+  # iperf2-compatible throughput testing, used by the `wifi iperf` command.
+  espressif/iperf-cmd: "~1.0.2"
+  # Advertises the web console as esp-bringup.local.
+  espressif/mdns: "^1.8"

@@ -1,0 +1,27 @@
+# ESP Board Bringup - checked-in project configuration.
+# `sdkconfig` itself is generated (and gitignored); edit this file instead
+# and re-run `idf.py reconfigure` (or delete sdkconfig) to apply.
+
+CONFIG_IDF_TARGET="esp32c3"
+
+# Console transport.
+#
+# The dev board enumerates as a CDC-ACM device (/dev/ttyACM*) because the C3
+# exposes a native USB-Serial-JTAG peripheral. A *secondary* console is
+# output-only, so the console must be the PRIMARY device or the shell will
+# print but never receive keystrokes.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# The attached ESP32-C3 has 4MB of embedded flash (verified with `esptool.py
+# flash_id`), not the 2MB the previous configuration assumed.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# Command line editing / history in the console component.
+CONFIG_CONSOLE_SORTED_HELP=y
+
+# Needed by the web interface (phase 4) for the command WebSocket.
+CONFIG_HTTPD_WS_SUPPORT=y

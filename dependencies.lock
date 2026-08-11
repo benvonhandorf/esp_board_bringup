@@ -1,0 +1,45 @@
+dependencies:
+  espressif/iperf:
+    component_hash: 7ee222b87da6e69118814a1e04fbc6e0af6814cdd364f7f51cb58770d2478224
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.3'
+    source:
+      registry_url: https://components.espressif.com
+      type: service
+    version: 1.0.2
+  espressif/iperf-cmd:
+    component_hash: 112e912c230db6e8863194854950a83d8ed042101d9c57ebdfab8a505c8d8c21
+    dependencies:
+    - name: espressif/iperf
+      registry_url: https://components.espressif.com
+      require: private
+      version: =1.0.2
+    - name: idf
+      require: private
+      version: '>=4.3'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.0.2
+  espressif/mdns:
+    component_hash: 8bcf12e37c58c1d584aef32a02b92548124c7a3a9fcf548d3235c844a035e0f0
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.11.1
+  idf:
+    source:
+      type: idf
+    version: 6.0.1
+direct_dependencies:
+- espressif/iperf-cmd
+- espressif/mdns
+manifest_hash: e35ad3d9725d2d05065dc4d80a2910d63710f6924d4bf99708d4e5ca6dbe2586
+target: esp32c3
+version: 3.0.0
