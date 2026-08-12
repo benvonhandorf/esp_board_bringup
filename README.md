@@ -668,19 +668,47 @@ Measured on the board this was developed against, a XIAO ESP32-S3 Sense with a
 | FAT write | 0.39 MiB/s | 0.39 MiB/s | 1.43 MiB/s |
 | Worst write block | 27.7 ms | 849.5 ms | 33.7 ms |
 
+And on an M5Stack Cardputer (SPI only — the slot breaks out just CLK 40, MOSI
+14, MISO 39, CS 12) with an 8 GB SanDisk `SA08G` from 2015:
+
+| | SPI @ 20 MHz |
+|---|---|
+| Raw read | 1.42 MiB/s |
+| FAT read | 0.93 MiB/s |
+| FAT write | 0.21 MiB/s |
+| Worst write block | 885.7 ms |
+
+The raw read matching the XIAO's 1.45 MiB/s across two different cards is the
+useful part: at 20 MHz over SPI the bus is the limit, not the card. Where the
+cards differ is writes — 0.21 MiB/s with an 885 ms worst-case block is this
+particular card's flash management, and it is why `bench` reports the worst
+block alongside the average.
+
 `sd sweep` found the limits to be 20 MHz over SPI and 40 MHz over SD 1-bit. Both
 are worth understanding, because neither is the card — and neither is an
 overclock, despite 40 MHz being above the 25 MHz the card advertises at default
 speed:
 
-- **Over SPI it stops at 20 MHz.** At 24 MHz and above, initialization fails in
-  `sdmmc_enable_hs_mode_and_check()` re-reading the CSD, and command CRC errors
-  follow. Two candidate causes, not yet separated: the pins used here (7, 8, 9)
-  are not the ESP32-S3's SPI2 IOMUX pins (CLK 12, MOSI 11, MISO 13), so the bus
-  runs through the GPIO matrix with its extra input delay; but the high-speed
-  switch is also only attempted at all above 20 MHz, so this card's SPI-mode
-  CMD6/SEND_CSD handling is equally suspect. Wiring the card to the IOMUX pins
-  would tell them apart.
+- **Over SPI it stops at 20 MHz, and this is a protocol threshold rather than a
+  speed limit.** Initialization fails in `sdmmc_enable_hs_mode_and_check()`
+  re-reading the CSD. That looks like a signal-integrity ceiling and is not one:
+
+  `sdmmc_init_card_hs_mode` runs *before* `sdmmc_init_host_frequency`, so the
+  failing SEND_CSD is issued at the 400 kHz initialization clock — the bus never
+  reaches the requested rate. The switch is attempted only when
+  `host.max_freq_khz > SDMMC_FREQ_DEFAULT`, which is 20000 exactly, so what
+  triggers it is crossing a constant in software.
+
+  Confirmed directly: **20000 kHz initializes and 20001 kHz does not**, with the
+  same `send_csd returned 0x108`. A 1 kHz difference cannot matter electrically,
+  and the SPI divider quantises both to the same clock anyway.
+
+  What the card does is accept the CMD6 high-speed switch and then fail the
+  SEND_CSD that follows it. `sdmmc_init_card_hs_mode` tolerates
+  `ESP_ERR_NOT_SUPPORTED` by falling back to 20 MHz, but treats every other
+  error as fatal, so this aborts the whole init instead of degrading. Two
+  different cards on two different boards behave identically, so it is not
+  specific to a card, a board, or the GPIO matrix.
 - **Over SD 1-bit it stops at 40 MHz** — that is the host, not the card, and it
   is a fixed divider rather than a negotiated rate. ESP-IDF's
   `sd_host_slot_get_clk_dividers()` maps *every* request of 40 MHz or more onto

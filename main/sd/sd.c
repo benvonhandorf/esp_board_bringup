@@ -1638,6 +1638,29 @@ int cmd_sd_sweep(int argc, char **argv)
                 ? best_kib_s / throughput_kib_s(&reference_timing) : 0.0);
         if (first_failure_khz) {
             tee(&sb, "First failure:    %d kHz requested.\n", first_failure_khz);
+            /*
+             * Above SDMMC_FREQ_DEFAULT the driver tries the CMD6 high-speed
+             * switch, and it does so while the bus is still at the 400kHz
+             * initialization clock -- sdmmc_init_card_hs_mode runs before
+             * sdmmc_init_host_frequency. So a failure that appears exactly one
+             * step above the default rate is a protocol threshold being
+             * crossed, not the wiring running out of margin, and reporting it
+             * as a speed limit sends people to look at their board for nothing.
+             * A card that answers "not supported" is handled gracefully; one
+             * that accepts the switch and then fails the follow-up SEND_CSD
+             * takes the whole init down with it.
+             */
+            if (best_actual_khz <= SDMMC_FREQ_DEFAULT &&
+                first_failure_khz > SDMMC_FREQ_DEFAULT) {
+                tee(&sb, "That first failure is the step where the driver begins "
+                         "attempting the high-speed switch, which it only does above "
+                         "%d kHz. The switch runs at the 400 kHz init clock, before the "
+                         "bus is ever set to the requested rate, so this is a protocol "
+                         "threshold rather than a signal limit -- requesting %d kHz "
+                         "fails where %d kHz works. Suspect the card's high-speed "
+                         "handling, not the board.\n",
+                    SDMMC_FREQ_DEFAULT, SDMMC_FREQ_DEFAULT + 1, SDMMC_FREQ_DEFAULT);
+            }
         } else if (host_clamped) {
             /*
              * Not the same thing as "the card is happy up here". Every larger
