@@ -755,10 +755,75 @@ static void print_farads(double c)
     }
 }
 
+/* Both rise times for one pin, in CPU cycles. UINT32_MAX means it never rose. */
+typedef struct {
+    uint32_t ext; /* external pull-up only */
+    uint32_t par; /* external in parallel with the internal pull-up */
+} rc_result_t;
+
+static rc_result_t measure_pin(int pin, uint32_t limit)
+{
+    const uint32_t overhead = measure_overhead(pin, limit);
+    rc_result_t r;
+    r.ext = measure_rise(pin, PULL_NONE, limit, overhead);
+    r.par = measure_rise(pin, PULL_UP, limit, overhead);
+    configure_pin_pull(pin, GPIO_MODE_INPUT, PULL_NONE);
+    return r;
+}
+
+/*
+ * Everything here scales with the internal pull-up, which is the one value that
+ * cannot be measured from the inside: the rise-time ratio gives R_ext/R_int, so
+ * an error in R_int passes straight through to every result. Naming a pin whose
+ * pull-up is known turns that around and solves for R_int instead, which then
+ * applies to every other pin on the chip.
+ */
+static bool calibrate_internal(int argc, char **argv, uint32_t limit, uint32_t cpu_hz,
+                               double *r_int)
+{
+    (void)cpu_hz;
+    if (argc < 5 || strcasecmp(argv[2], "ref") != 0) {
+        if (argc > 2) {
+            bp_error("Expected 'ref <pin> <kohms>' after the pin list");
+            return false;
+        }
+        return true; /* no calibration requested */
+    }
+
+    const int ref_pin = atoi(argv[3]);
+    const double ref_ohms = strtod(argv[4], NULL) * 1000.0;
+    const char *why = NULL;
+    if (!GPIO_IS_VALID_GPIO(ref_pin) || !pin_is_drivable(ref_pin, &why)) {
+        bp_error("Reference GPIO %d cannot be driven%s%s", ref_pin,
+                 why ? ": " : "", why ? why : "");
+        return false;
+    }
+    if (ref_ohms <= 0) {
+        bp_error("Reference resistance must be positive");
+        return false;
+    }
+
+    const rc_result_t r = measure_pin(ref_pin, limit);
+    if (r.ext == UINT32_MAX || r.par == UINT32_MAX || r.par == 0) {
+        bp_error("GPIO %d does not behave like a pulled-up net, so it cannot "
+                 "be the reference", ref_pin);
+        return false;
+    }
+    const double ratio = (double)r.ext / (double)r.par;
+    if (ratio <= 1.05) {
+        bp_error("GPIO %d rises too fast to time, so it cannot be the reference. "
+                 "Use a weaker pull-up", ref_pin);
+        return false;
+    }
+
+    *r_int = ref_ohms / (ratio - 1.0);
+    return true;
+}
+
 int cmd_gpio_rc(int argc, char **argv)
 {
     if (argc < 2) {
-        bp_printf("Usage: rc <pin>\n");
+        bp_printf("Usage: rc <pin> [ref <pin> <kohms>]\n");
         return -1;
     }
 
@@ -772,13 +837,31 @@ int cmd_gpio_rc(int argc, char **argv)
     const uint32_t cpu_hz = (uint32_t)esp_clk_cpu_freq();
     const uint32_t limit_cycles = (uint32_t)((uint64_t)RC_TIMEOUT_US * cpu_hz / 1000000);
 
+    double r_int = RC_R_INTERNAL;
+    if (!calibrate_internal(argc, argv, limit_cycles, cpu_hz, &r_int)) {
+        free(pins);
+        return -1;
+    }
+    const bool calibrated = (r_int != RC_R_INTERNAL);
+
     bp_printf("Pull-up strength and net capacitance, from how long each pin\n"
               "takes to rise after being released from a driven low. Measured\n"
-              "twice, the second time with the internal pull-up (~%.0fk) added,\n"
-              "which gives the reference needed to solve for both values.\n"
-              "Accurate to roughly a factor of two -- the internal pull-up is\n"
-              "not a precision part. Nothing else may be driving these pins.\n\n",
-              RC_R_INTERNAL / 1000.0);
+              "twice, the second time with the internal pull-up added, which\n"
+              "gives the reference needed to solve for both values.\n"
+              "Nothing else may be driving these pins.\n\n");
+
+    if (calibrated) {
+        bp_printf("Internal pull-up measured as %.1fk against the %s reference\n"
+                  "on GPIO %s. Results below use that.\n\n",
+                  r_int / 1000.0, argv[4], argv[3]);
+    } else {
+        bp_printf("Internal pull-up assumed to be %.0fk, its nominal value. It is\n"
+                  "not a precision part, and every result scales with it, so treat\n"
+                  "these as good to a factor of two. Ratios between pins are exact.\n"
+                  "Pass 'ref <pin> <kohms>' naming a pin whose pull-up you know to\n"
+                  "measure the internal one instead.\n\n",
+                  RC_R_INTERNAL / 1000.0);
+    }
 
     bp_printf(" pin    external   with int    pull-up      net C\n");
 
@@ -794,48 +877,47 @@ int cmd_gpio_rc(int argc, char **argv)
             continue;
         }
 
-        const uint32_t overhead = measure_overhead(pin, limit_cycles);
-        const uint32_t ext = measure_rise(pin, PULL_NONE, limit_cycles, overhead);
-        const uint32_t par = measure_rise(pin, PULL_UP, limit_cycles, overhead);
-        configure_pin_pull(pin, GPIO_MODE_INPUT, PULL_NONE);
+        const rc_result_t r = measure_pin(pin, limit_cycles);
 
         bp_printf("%4d  ", pin);
 
-        if (par == UINT32_MAX) {
+        if (r.par == UINT32_MAX) {
             /* Not even the internal pull-up gets it there in the time allowed. */
             bp_printf("        --         --         --         --"
                       "  held low, or >80nF\n");
             continue;
         }
 
-        const double t_par = (double)par / cpu_hz;
-        if (ext == UINT32_MAX) {
+        const double t_par = (double)r.par / cpu_hz;
+        if (r.ext == UINT32_MAX) {
             bp_printf("      none  ");
             print_seconds(t_par);
             bp_printf("       none  ");
-            print_farads(t_par / RC_THRESHOLD_TAUS / RC_R_INTERNAL);
+            print_farads(t_par / RC_THRESHOLD_TAUS / r_int);
             bp_printf("  no external pull-up\n");
             continue;
         }
 
-        const double t_ext = (double)ext / cpu_hz;
+        const double t_ext = (double)r.ext / cpu_hz;
         print_seconds(t_ext);
         bp_printf("  ");
         print_seconds(t_par);
         bp_printf("  ");
 
         /*
-         * Adding a 45k pull-up to a net that already has one must speed it up.
-         * If it did not, the rise is too fast to time and the external pull-up
-         * is much stronger than the reference -- not weaker.
+         * Adding the internal pull-up to a net that already has one must speed
+         * it up. If it did not, the rise is too fast to time and the external
+         * pull-up is much stronger than the reference -- not weaker.
          */
         const double ratio = t_ext / t_par;
         if (ratio <= 1.05) {
-            bp_printf("    <2.5 k         --  too fast to resolve\n");
+            bp_printf("  ");
+            print_ohms(r_int / 20.0);
+            bp_printf(">        --  too fast to resolve\n");
             continue;
         }
 
-        const double r_ext = RC_R_INTERNAL * (ratio - 1.0);
+        const double r_ext = r_int * (ratio - 1.0);
         print_ohms(r_ext);
         bp_printf("  ");
         print_farads(t_ext / RC_THRESHOLD_TAUS / r_ext);

@@ -130,7 +130,7 @@ That short stalled SD card init in a way that looked nothing like a wiring
 fault — the host never got its clock started, because it waits for the data bus
 to go idle and every CLK low was dragging D0 down with it.
 
-#### `rc <pin>`
+#### `rc <pin> [ref <pin> <kohms>]`
 
 Measures the **pull-up strength and capacitance of each net**. `short` answers
 "are these two nets the same net"; this answers "is this net pulled up, how
@@ -150,10 +150,27 @@ t_ext / t_par = (R_ext + R_int) / R_int
 
 so `R_ext = R_int · (t_ext/t_par − 1)`, and `C` follows. No meter needed.
 
-The internal pull-up is only nominally 45k and varies widely with process and
-temperature, so both results are worth about a factor of two. That is enough:
-the cases this separates differ by orders of magnitude. A signal net is single
--digit pF; a net tied to an unpowered rail's decoupling capacitor is tens of nF.
+**The internal pull-up is the one thing that cannot be measured from the
+inside**, and every result scales with it. Nominally 45k, it varies widely with
+process and temperature — on the ESP32-S3 measured here it is actually 35k. So
+uncalibrated results are worth about a factor of two, which is still enough to
+separate the cases this exists for: a signal net is single-digit pF, a net tied
+to an unpowered rail's decoupling capacitor is tens of nF.
+
+**Ratios between pins are exact regardless**, because the threshold and the
+capacitance cancel in `t_ext/t_par`. Two pins that differ by 2× really do differ
+by 2×, even when neither absolute value can be trusted. Read the table that way
+before reading the numbers.
+
+To get absolute accuracy, name a pin whose pull-up you know and the measurement
+runs backwards to solve for `R_int`, which then applies to every other pin:
+
+```
+> gpio rc 38-44 ref 41 50
+Internal pull-up measured as 34.9k against the 50 reference on GPIO 41.
+```
+
+A good reference is a net with a known fitted resistor and nothing else on it.
 
 Timing is done by releasing the pad and sampling it once at a chosen delay,
 binary-searching for the crossing, with the delay-to-sample cost calibrated out
@@ -161,31 +178,37 @@ by driving the same pin push-pull. Polling `gpio_get_level()` in a loop instead
 only resolves one iteration — about 290 ns here, the same order as the rise
 being measured, which quantises every net to the same two numbers.
 
-Sample, on the SD slot of an ESP32-S3 board:
+Sample, on the SD slot of an ESP32-S3 board with 50k pull-ups fitted on CMD
+and DAT0–3, calibrated against one of them, with a card in the slot:
 
 ```
-> gpio rc 38-44
+> gpio rc 38-44 ref 41 50
+Internal pull-up measured as 34.9k against the 50 reference on GPIO 41.
+
  pin    external   with int    pull-up      net C
-  38      650 ns      244 ns    75.0 k      6.3 pF
-  39      650 ns      256 ns    69.1 k      6.8 pF
-  40        none      462 ns       none      7.4 pF  no external pull-up
-  41      650 ns      275 ns    61.4 k      7.6 pF
-  42      356 ns      200 ns    35.2 k      7.3 pF
-  43      650 ns      269 ns    63.8 k      7.3 pF
-  44          --         --         --         --  held low, or >80nF
+  38      650 ns      250 ns    55.9 k      8.4 pF     D1
+  39      650 ns      269 ns    49.5 k      9.5 pF     D0
+  40        none      462 ns       none      9.6 pF    CLK
+  41      650 ns      275 ns    47.6 k      9.8 pF     CMD
+  42      369 ns      200 ns    29.5 k      9.0 pF     D3
+  43      650 ns      238 ns    60.7 k      7.7 pF     D2
+  44          --         --         --         --      DET
 ```
 
-Reading that: GPIO40 is SD CLK, which correctly has no pull-up; GPIO44 is
-card detect, held low by the switch with a card in. The rest sit at 60–75k
-except D3 at 35k — the signature of an SD card's *own* internal pull-ups
-rather than the board's, since cards pull up CMD and DAT0–3 but never CLK,
-and DAT3's is deliberately stronger for card detection. Pulling the card and
-re-running is what tells the two apart. Every net measures ~7 pF, which is a
-bare pin and a short trace: nothing unexpected is hanging off the bus.
+Reading that: **CLK correctly has no pull-up** — the host always drives it
+push-pull, and a pull-up there would be a design error. **DET is held low** by
+the card-detect switch, which is how you know a card is seated. CMD and DAT0–2
+average 53k against a fitted 50k, so the scatter is the measurement, not the
+board.
 
-Two independent methods agree on that ~7 pF — GPIO40 gets it from the known
-45k internal pull-up alone, the others from the two-point solve — which is a
-useful self-check that the numbers mean something.
+**DAT3 at 29.5k is the interesting one, and it is correct.** Solving
+`50k ‖ X = 29.5k` gives 72k, which is the pull-up *inside the card* used for
+card detection before the host knows anything about the card — the SD spec puts
+it at 10–90k. Every SD slot with a card in it should show DAT3 at roughly half
+its neighbours. Pull the card and it rises to match them.
+
+Every net is 8–10 pF: a bare pin and a short trace, nothing unexpected hanging
+off the bus.
 
 Holding the other lines low with `gpio set` and re-measuring one of them is a
 way to ask whether a rail is real: if a net's pull-up is being fed parasitically
