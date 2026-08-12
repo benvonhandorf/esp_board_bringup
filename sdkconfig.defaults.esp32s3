@@ -1,0 +1,8 @@
+# ESP32-S3 specific configuration, layered on top of sdkconfig.defaults by
+# `idf.py set-target esp32s3`.
+#
+# The board this was developed against is a Seeed XIAO ESP32-S3 (Sense), which
+# carries 8MB of flash. Unlike the C3 this chip has an SD host peripheral, so
+# the `sd mmc` commands (1-bit and 4-bit SD mode) are compiled in here and
+# compiled out on the C3.
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y

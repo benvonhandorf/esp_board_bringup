@@ -1,16 +1,22 @@
 #include "esp_bringup.h"
 #include "output.h"
+#include "sd.h"
 #include "spi.h"
 
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
 
-#define SPI_HOST_ID SPI2_HOST
+#define SPI_HOST_ID BP_SPI_HOST_ID
 #define SPI_CLOCK_HZ 1000000
 #define MAX_TRANSFER_BYTES 255
 
 static spi_device_handle_t device;
 static bool bus_ready;
+
+bool spi_menu_owns_host(void)
+{
+    return bus_ready;
+}
 
 static bool require_bus(void)
 {
@@ -70,6 +76,16 @@ int cmd_spi_bus(int argc, char **argv)
         return -1;
     }
 
+    /*
+     * There is only one SPI host in play, and the SD module may be holding it.
+     * Taking it away would leave an initialized card talking to a bus that no
+     * longer exists, so say so instead.
+     */
+    if (sd_owns_spi_host()) {
+        bp_error("The SD card holds the SPI host. Release it with 'sd close' first.");
+        return -1;
+    }
+
     /* Free any previous bus so this command can be re-run with new pins. */
     teardown();
 
@@ -111,6 +127,25 @@ int cmd_spi_bus(int argc, char **argv)
         bp_printf("none (drive chip select yourself with 'gpio set')");
     }
     bp_printf(", mode 0 at %d Hz\n", SPI_CLOCK_HZ);
+    return 0;
+}
+
+/*
+ * Hand the host back without a reset. Needed because the SD module competes for
+ * the same host, and on single-host chips there is otherwise no way to move from
+ * `spi bus` to `sd spi` in one session.
+ */
+int cmd_spi_free(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    if (!bus_ready) {
+        bp_printf("SPI bus is not initialized.\n");
+        return 0;
+    }
+    teardown();
+    bp_printf("SPI bus released.\n");
     return 0;
 }
 

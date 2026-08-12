@@ -1,6 +1,10 @@
 # ESP Board Bringup - checked-in project configuration.
 # `sdkconfig` itself is generated (and gitignored); edit this file instead
 # and re-run `idf.py reconfigure` (or delete sdkconfig) to apply.
+#
+# Chip specific settings live in sdkconfig.defaults.<target>, which IDF layers
+# on top of this file. The target below is only the default guess used when no
+# sdkconfig exists yet; `idf.py set-target <chip>` overrides it.
 
 CONFIG_IDF_TARGET="esp32c3"
 
@@ -12,10 +16,6 @@ CONFIG_IDF_TARGET="esp32c3"
 # print but never receive keystrokes.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
-
-# The attached ESP32-C3 has 4MB of embedded flash (verified with `esptool.py
-# flash_id`), not the 2MB the previous configuration assumed.
-CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"

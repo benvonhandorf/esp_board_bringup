@@ -10,6 +10,7 @@
 #include "ina237.h"
 #include "sht4x.h"
 #include "nau7802.h"
+#include "sd.h"
 #include "spi.h"
 #include "system.h"
 #include "uart.h"
@@ -139,6 +140,7 @@ static const bp_command_t spi_commands[] = {
     {"bus", "<clk> <mosi> <miso> [cs]", "Initialize the SPI bus", cmd_spi_bus},
     {"read", "<addr> <len>", "Read bytes from an address", cmd_spi_read},
     {"write", "<addr> <data>...", "Write bytes to an address", cmd_spi_write},
+    {"free", "", "Release the SPI host so another module can use it", cmd_spi_free},
 };
 
 static const bp_menu_t spi_menu = {
@@ -146,6 +148,22 @@ static const bp_menu_t spi_menu = {
     .help = "SPI master",
     .commands = spi_commands,
     .command_count = ARRAY_COUNT(spi_commands),
+};
+
+static const bp_command_t sd_commands[] = {
+    {"spi", "<clk> <mosi> <miso> <cs> [khz <freq>]", "Bring a card up over SPI", cmd_sd_spi},
+    {"mmc", "<clk> <cmd> <d0> [<d1> <d2> <d3>] [khz <freq>]", "Bring a card up in 1-bit or 4-bit SD mode", cmd_sd_mmc},
+    {"info", "", "Report the detected card", cmd_sd_info},
+    {"bench", "[size_kb] [block_kb]", "Measure write and read speed through FAT", cmd_sd_bench},
+    {"raw", "[size_kb] [block_kb] [start_sector]", "Measure read speed with no filesystem", cmd_sd_raw},
+    {"close", "", "Unmount, release the card and free the bus", cmd_sd_close},
+};
+
+static const bp_menu_t sd_menu = {
+    .name = "sd",
+    .help = "SD/MMC cards over SPI, 1-bit or 4-bit SD, with speed testing",
+    .commands = sd_commands,
+    .command_count = ARRAY_COUNT(sd_commands),
 };
 
 static const bp_command_t wifi_commands[] = {
@@ -169,6 +187,7 @@ static const bp_menu_t *const root_submenus[] = {
     &i2c_menu,
     &uart_menu,
     &spi_menu,
+    &sd_menu,
 };
 
 const bp_menu_t bp_root_menu = {

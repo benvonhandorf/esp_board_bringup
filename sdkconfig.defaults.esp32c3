@@ -1,0 +1,6 @@
+# ESP32-C3 specific configuration, layered on top of sdkconfig.defaults by
+# `idf.py set-target esp32c3`.
+
+# The attached ESP32-C3 has 4MB of embedded flash (verified with `esptool.py
+# flash_id`), not the 2MB the original configuration assumed.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y

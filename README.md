@@ -7,13 +7,23 @@ The menu system and all outputs are visible on the primary serial port and a web
 ## Building and running
 
 ```sh
-idf.py set-target esp32c3        # first time only
+idf.py set-target esp32c3        # or esp32s3; first time only, and to switch
 idf.py build
 idf.py -p /dev/ttyACM1 flash monitor
 ```
 
 Project configuration lives in `sdkconfig.defaults`; `sdkconfig` itself is generated
 and gitignored. Delete it or run `idf.py reconfigure` after editing the defaults.
+
+Chip-specific settings live in `sdkconfig.defaults.<target>`, which ESP-IDF layers
+on top of the shared file — flash size differs between the boards, and the ESP32-C3
+has no SD host peripheral, so `sd mmc` is compiled out there. The target named in
+`sdkconfig.defaults` is only the default guess used when no `sdkconfig` exists;
+`idf.py set-target` overrides it.
+
+One caveat when switching: `.vscode/settings.json` sets `IDF_TARGET` as an
+environment variable, which outranks everything else and will fail the build with a
+CMake cache mismatch. Update it to match, or build from a plain shell.
 
 The console is the chip's **primary** serial device. On boards with a native
 USB-Serial-JTAG port (which enumerate as `/dev/ttyACM*`) that must be
@@ -310,6 +320,125 @@ the bytes clocked back during it are reported.
 
 Writes data to the specified address on the SPI bus. Data bytes may be given in
 decimal or as `0x` hex.
+
+#### `free`
+
+Releases the SPI host and the pins, without a reset. The SD menu competes for
+the same host — on chips with only one general purpose SPI host, such as the
+ESP32-C3, there would otherwise be no way to move from `spi bus` to `sd spi`
+within a session.
+
+### SD
+
+Brings a card up over any of the three interfaces a board might have wired, and
+measures how fast it actually goes. Which interface a board provides, and
+whether the card keeps up, is exactly the kind of thing that has to be
+established before a BSP exists.
+
+Bring-up is deliberately in two stages. `sd spi` and `sd mmc` initialize the
+card and nothing more; the filesystem is only mounted when `sd bench` needs one.
+That way a blank, corrupt or non-FAT card still reports its identity through
+`sd info` and is still measurable through `sd raw`, instead of the whole thing
+unwinding because there was no FAT partition to mount.
+
+**Neither benchmark writes to the card outside a filesystem.** `sd bench` creates
+`/sd/bench.tmp`, reads it back and deletes it; `sd raw` is read-only. Nothing
+that was on the card is disturbed.
+
+#### `spi <clk> <mosi> <miso> <cs> [khz <freq>]`
+
+Brings the card up over SPI. This is the only option on chips without an SD host
+peripheral — notably the ESP32-C3, where `sd mmc` is not compiled in at all.
+
+The frequency is a `khz` keyword pair rather than a trailing number because
+`mmc` below takes a variable number of pins, and a bare number could not be told
+apart from another pin. It defaults to 20 MHz; 40 MHz is the high-speed rate.
+What the host divider actually produced is reported, since it quantizes.
+
+Re-running the command tears the previous configuration down first, so pins and
+frequency can be changed freely.
+
+#### `mmc <clk> <cmd> <d0> [<d1> <d2> <d3>] [khz <freq>]`
+
+Brings the card up on the dedicated SD host. Three pins select 1-bit mode, six
+select 4-bit — the pin count is what picks the width, so there is no separate
+and forgettable width argument.
+
+The width is applied to the *slot*, not to the host flags. ESP-IDF reads the
+slot width back and narrows the host to match, so setting the slot is what
+actually stops a 1-bit slot from being switched to 4-bit partway through
+initialization.
+
+Internal pull-ups are enabled on the bus. They are weak and no substitute for
+proper external ones, but a board being brought up frequently has none fitted at
+all, and getting the card to answer is the point of the exercise.
+
+Note that a card put into SPI mode by `sd spi` **stays** in SPI mode until its
+power is removed; that is the card's behaviour, not this tool's. A board reset
+does not do it. Test SD mode first, or physically power-cycle in between.
+
+#### `info`
+
+Reports the detected card: the interface and pins in use, card type, product
+name, the CID (manufacturer, OEM, revision, serial and manufacture date),
+capacity and sector geometry from the CSD, negotiated bus width, and the
+filesystem's total and free space when one is mounted.
+
+Two clocks are reported, not one. The first is what the host is really clocking
+the card at, the second is the ceiling the card itself advertises — together
+they say whether the interface or the card is the limit.
+
+#### `bench [size_kb] [block_kb]`
+
+Mounts FAT if it is not already mounted, then writes, reads back and deletes
+`/sd/bench.tmp`. Defaults to 512 KB in 16 KB blocks.
+
+The write measurement includes the final flush. Without it the card is still
+absorbing the tail of the data when the clock stops, and the figure reported is
+the speed of filling a RAM buffer rather than the speed of the card.
+
+Every block is verified against what was written, and each carries its block
+index, so a filesystem handing back the wrong block is reported rather than
+scored. The comparison is done outside the timed region and is not charged to
+the card.
+
+#### `raw [size_kb] [block_kb] [start_sector]`
+
+Reads whole sectors straight off the card with no filesystem in the way. The
+gap between this and `bench` is what FAT costs.
+
+It is read-only, so it is safe to run anywhere on the card. Blocks are rounded
+down to whole sectors and the range is checked against the card's capacity.
+
+#### `close`
+
+Unmounts, releases the card and frees the bus.
+
+#### Reported numbers
+
+Both benchmarks report the average throughput **and the slowest single block**.
+The worst case is not a footnote: SD cards stall for tens of milliseconds while
+they do internal housekeeping, and on a board that has to keep up with a sensor
+or a camera that stall is what decides whether the design works. An average
+hides it entirely.
+
+Sanity-check the result against the interface ceiling — 20 MHz gives 2.5 MB/s on
+SPI or 1-bit SD, and 10 MB/s on 4-bit SD. A number above the ceiling means
+something was measured other than the card.
+
+#### Example: Seeed XIAO ESP32-S3 Sense
+
+The Sense expansion board's microSD is on CLK/SCK `GPIO7`, CMD/MOSI `GPIO9`,
+D0/MISO `GPIO8` and CS `GPIO21`:
+
+```
+sd spi 7 9 8 21     # SD over SPI
+sd close
+sd mmc 7 9 8        # SD 1-bit on the same pins
+```
+
+D1, D2 and D3 are not brought out on that board, so 4-bit mode cannot be
+exercised there even though the command supports it.
 
 ### System
 
