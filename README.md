@@ -478,14 +478,37 @@ Measured on the board this was developed against, a XIAO ESP32-S3 Sense with a
 `sd sweep` found the limits to be 20 MHz over SPI and 40 MHz over SD 1-bit. Both
 are worth understanding, because neither is the card:
 
-- **Over SPI it stops at 20 MHz.** At 24 MHz and above the high-speed switch
-  fails re-reading the CSD and the bus starts reporting command CRC errors. The
-  pins used here (7, 8, 9) are not the ESP32-S3's IOMUX pins for SPI2, so the
-  signals go through the GPIO matrix and the extra input delay is what runs out.
-- **Over SD 1-bit it stops at 40 MHz** — but that is the host clamping, not the
-  card. Every request above 40 MHz produced exactly 40.000 MHz, so the card was
-  never actually driven faster and 40 MHz is not known to be its limit. It was
+- **Over SPI it stops at 20 MHz.** At 24 MHz and above, initialization fails in
+  `sdmmc_enable_hs_mode_and_check()` re-reading the CSD, and command CRC errors
+  follow. Two candidate causes, not yet separated: the pins used here (7, 8, 9)
+  are not the ESP32-S3's SPI2 IOMUX pins (CLK 12, MOSI 11, MISO 13), so the bus
+  runs through the GPIO matrix with its extra input delay; but the high-speed
+  switch is also only attempted at all above 20 MHz, so this card's SPI-mode
+  CMD6/SEND_CSD handling is equally suspect. Wiring the card to the IOMUX pins
+  would tell them apart.
+- **Over SD 1-bit it stops at 40 MHz** — that is the host, not the card, and it
+  is a fixed divider rather than a negotiated rate. ESP-IDF's
+  `sd_host_slot_get_clk_dividers()` maps *every* request of 40 MHz or more onto
+  `host_div = 4`, i.e. 160 MHz / 4 = exactly 40 MHz, so the card was never
+  driven faster and its own limit is unknown. See the note below. The card was
   still 15 MHz above its rated 25 MHz and read correctly throughout.
+
+##### Why 40 MHz is the SD-mode ceiling
+
+The ESP32-S3's SD host is fed only by PLL_160M or the 40 MHz crystal — there is
+no 200 MHz source, and `SOC_SDMMC_UHS_I_SUPPORTED` is not defined for it, so
+UHS-I (SDR50 at 100 MHz, SDR104 at 208 MHz) does not exist on this chip. That
+puts SD High Speed, specified to a 50 MHz maximum, at the top of what the part
+can do.
+
+Dividing 160 MHz by an integer, the options either side of that limit are
+160/4 = 40 MHz and 160/3 = 53.3 MHz. The latter is over the 50 MHz High Speed
+ceiling, so 40 MHz is the fastest in-spec rate the clock tree can produce, and
+ESP-IDF hard-codes it for any request at or above 40 MHz.
+
+So the 40 MHz wall is not a silicon divider limit — the hardware could emit
+53.3 MHz or 80 MHz — but there is no way to ask for those through the public
+API, and both would be outside the SD specification.
 
 Note the 849.5 ms worst-case write block at 20 MHz, against 33.7 ms for the same
 card at 40 MHz. That is not the clock — it is the card pausing for internal
