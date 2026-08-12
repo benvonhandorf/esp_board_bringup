@@ -17,16 +17,23 @@
 #include "output.h"
 #include "sd.h"
 #include "spi.h"
+#include "system.h"
 
 #include <errno.h>
 #include <inttypes.h>
+#include <stdarg.h>
 #include <unistd.h>
 
 #include "diskio_impl.h"
 #include "diskio_sdmmc.h"
 #include "driver/gpio.h"
 #include "driver/sdspi_host.h"
+#include "esp_app_desc.h"
+#include "esp_chip_info.h"
+#include "esp_flash.h"
 #include "esp_heap_caps.h"
+#include "esp_idf_version.h"
+#include "esp_mac.h"
 #include "esp_rom_crc.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
@@ -41,6 +48,8 @@
 
 #define SD_MOUNT_POINT "/sd"
 #define SD_BENCH_FILE SD_MOUNT_POINT "/bench.tmp"
+/* 8.3, so it works with the default CONFIG_FATFS_LFN_NONE. */
+#define SD_RESULTS_FILE SD_MOUNT_POINT "/sdbench.txt"
 #define SD_MAX_OPEN_FILES 4
 
 #define DEFAULT_SIZE_KB 512
@@ -69,6 +78,7 @@ static struct {
     int pin_count;
     int width;                          /* 1 or 4, for IFACE_MMC */
     int freq_khz;
+    int cd_pin;                         /* GPIO_NUM_NC when card detect is unused */
 } cfg;
 
 /*
@@ -182,23 +192,31 @@ static void teardown(void)
  * bare number could not be told apart from another pin. This mirrors the
  * `nau7802 init ldo 3.0` idiom.
  */
-static int take_frequency(int argc, char **argv, int index, int *freq_khz)
+static int take_options(int argc, char **argv, int index, int *freq_khz, int *cd_pin)
 {
-    if (index >= argc) {
-        return 0;
-    }
-    if (strcasecmp(argv[index], "khz") != 0) {
-        bp_error("Unexpected argument '%s'; the only option is 'khz <freq>'", argv[index]);
-        return -1;
-    }
-    if (index + 2 != argc) {
-        bp_error("'khz' takes exactly one frequency in kHz");
-        return -1;
-    }
-    if (parse_int_arg(argv[index + 1], freq_khz) < 0 ||
-        *freq_khz < MIN_FREQ_KHZ || *freq_khz > MAX_FREQ_KHZ) {
-        bp_error("Frequency must be %d-%d kHz", MIN_FREQ_KHZ, MAX_FREQ_KHZ);
-        return -1;
+    while (index < argc) {
+        if (index + 1 >= argc) {
+            bp_error("'%s' needs a value", argv[index]);
+            return -1;
+        }
+        if (strcasecmp(argv[index], "khz") == 0) {
+            if (parse_int_arg(argv[index + 1], freq_khz) < 0 ||
+                *freq_khz < MIN_FREQ_KHZ || *freq_khz > MAX_FREQ_KHZ) {
+                bp_error("Frequency must be %d-%d kHz", MIN_FREQ_KHZ, MAX_FREQ_KHZ);
+                return -1;
+            }
+        } else if (strcasecmp(argv[index], "cd") == 0) {
+            if (parse_int_arg(argv[index + 1], cd_pin) < 0 ||
+                !GPIO_IS_VALID_GPIO(*cd_pin)) {
+                bp_error("Card detect must be a valid pin number, not '%s'", argv[index + 1]);
+                return -1;
+            }
+        } else {
+            bp_error("Unexpected argument '%s'; options are 'khz <freq>' and 'cd <pin>'",
+                     argv[index]);
+            return -1;
+        }
+        index += 2;
     }
     return 0;
 }
@@ -284,6 +302,12 @@ int cmd_sd_info(int argc, char **argv)
     }
     bp_printf("\n");
 
+    if (cfg.cd_pin != GPIO_NUM_NC) {
+        /* Active low: the switch closes to ground when a card is seated. */
+        bp_printf("Detect:    GPIO %d reads %d (%s)\n", cfg.cd_pin,
+                  gpio_get_level(cfg.cd_pin),
+                  gpio_get_level(cfg.cd_pin) ? "no card" : "card present");
+    }
     bp_printf("Type:      %s\n", card_type());
     bp_printf("Name:      %.8s\n", card->cid.name);
 
@@ -387,6 +411,7 @@ static esp_err_t open_spi(void)
     sdspi_device_config_t dev_config = SDSPI_DEVICE_CONFIG_DEFAULT();
     dev_config.host_id = BP_SPI_HOST_ID;
     dev_config.gpio_cs = cfg.pins[3];
+    dev_config.gpio_cd = cfg.cd_pin;
 
     err = sdspi_host_init_device(&dev_config, &spi_dev);
     if (err != ESP_OK) {
@@ -421,7 +446,7 @@ static esp_err_t open_mmc(void)
         slot_config.d2 = cfg.pins[4];
         slot_config.d3 = cfg.pins[5];
     }
-    slot_config.cd = SDMMC_SLOT_NO_CD;
+    slot_config.cd = cfg.cd_pin;    /* SDMMC_SLOT_NO_CD unless 'cd <pin>' was given */
     slot_config.wp = SDMMC_SLOT_NO_WP;
     slot_config.width = (uint8_t)cfg.width;
     /* Boards being brought up frequently lack the external pull-ups the bus
@@ -485,23 +510,93 @@ static esp_err_t open_card(void)
 }
 
 /*
- * A card that answers CMD0 and CMD8 but then times out on ACMD41 has been asked
- * to power up and never finished. In practice on a bring-up bench that is
- * almost never the driver: the card has latched into SPI mode, or a connector is
- * marginal. Both cost minutes to find and seconds to fix, so say so rather than
- * leaving a bare ESP_ERR_TIMEOUT.
+ * A timeout out of card init can come from two very different places, and the
+ * error code alone does not say which -- an earlier version of this hint
+ * asserted the card had failed ACMD41 and sent a real diagnosis down the wrong
+ * path when the host had actually stalled before sending anything.
  */
 static void explain_init_timeout(esp_err_t err)
 {
     if (err != ESP_ERR_TIMEOUT) {
         return;
     }
-    bp_printf("      The card did not complete power-up (ACMD41). Usually one of:\n");
-    bp_printf("      - It is latched in SPI mode from an earlier 'sd spi'. A card\n");
-    bp_printf("        leaves SPI mode only when its power is removed, and a board\n");
-    bp_printf("        reset does not do that -- unplug and replug the board.\n");
-    bp_printf("      - The card or an expansion connector is not fully seated.\n");
-    bp_printf("      - The card is failing. Try another one.\n");
+    bp_printf("      Timed out initializing. Check the log lines above for where:\n");
+    bp_printf("      - 'sdmmc_init_ocr ... send_op_cond' means the card answered the\n");
+    bp_printf("        first commands but never finished powering up. Usually it is\n");
+    bp_printf("        latched in SPI mode from an earlier 'sd spi' -- a card leaves\n");
+    bp_printf("        SPI mode only when its power is removed, and a board reset\n");
+    bp_printf("        does not do that. Unplug and replug the board. Failing that,\n");
+    bp_printf("        reseat the card, or try a different one.\n");
+    bp_printf("      - 'clock_update_command' or 'failed to set clk' means the host\n");
+    bp_printf("        never even got its clock running. It waits for the data bus to\n");
+    bp_printf("        go idle before accepting that command, so a CMD or D0 line held\n");
+    bp_printf("        low stalls it here. That is wiring, not the card: check the\n");
+    bp_printf("        pins with 'gpio read <pins> up'.\n");
+}
+
+/*
+ * Warn about lines that are already held low before the SD host is handed the
+ * pins.
+ *
+ * CMD and the data lines idle high through pull-ups on any working SD wiring.
+ * One stuck low makes the host's clock-update command wait forever for an idle
+ * bus, which surfaces as an unhelpful timeout deep in the driver. Checking first
+ * turns that into a specific, actionable line. Only a warning: the levels are a
+ * strong hint, not proof, and the real attempt may still be informative.
+ */
+static void warn_if_bus_held_low(const int *pins, int count, const char *const *names)
+{
+    /* Index 0 is CLK, which the host drives; the rest should idle high. */
+    for (int i = 1; i < count; i++) {
+        const gpio_config_t probe = {
+            .pin_bit_mask = BIT64(pins[i]),
+            .mode = GPIO_MODE_INPUT,
+            .pull_up_en = GPIO_PULLUP_ENABLE,
+            .pull_down_en = GPIO_PULLDOWN_DISABLE,
+            .intr_type = GPIO_INTR_DISABLE,
+        };
+        if (gpio_config(&probe) != ESP_OK) {
+            continue;
+        }
+        if (gpio_get_level(pins[i]) == 0) {
+            bp_printf("Warning: %s (GPIO %d) reads low with a pull-up enabled, so it is\n"
+                      "         being held down. The host waits for an idle bus before it\n"
+                      "         will start its clock, so this alone can stall init.\n",
+                      names[i], pins[i]);
+        }
+    }
+
+    /*
+     * Then look for a short between CLK and a data line.
+     *
+     * That one does not show up above: at rest every line floats high through
+     * its pull-up and looks fine. It only bites once the host starts clocking,
+     * when every CLK low pulls the shorted data line down with it, the bus never
+     * reads idle, and the clock-update command hangs. Driving CLK low for a
+     * moment and seeing which lines follow reproduces it in microseconds. CLK is
+     * a host output, so driving it here costs nothing.
+     */
+    const gpio_config_t clk_out = {
+        .pin_bit_mask = BIT64(pins[0]),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    if (gpio_config(&clk_out) != ESP_OK) {
+        return;
+    }
+    gpio_set_level(pins[0], 0);
+
+    for (int i = 1; i < count; i++) {
+        if (gpio_get_level(pins[i]) == 0) {
+            bp_printf("Warning: %s (GPIO %d) follows %s (GPIO %d) low, so those two are\n"
+                      "         shorted together. The host cannot start its clock while a\n"
+                      "         data line is tied to it -- this must be fixed in hardware.\n",
+                      names[i], pins[i], names[0], pins[0]);
+        }
+    }
+    gpio_set_level(pins[0], 1);
 }
 
 /*
@@ -530,7 +625,7 @@ static bool frequency_is_reserved(int freq_khz)
 int cmd_sd_spi(int argc, char **argv)
 {
     if (argc < 5) {
-        bp_printf("Usage: spi <clk> <mosi> <miso> <cs> [khz <freq>]\n");
+        bp_printf("Usage: spi <clk> <mosi> <miso> <cs> [cd <pin>] [khz <freq>]\n");
         return -1;
     }
 
@@ -544,12 +639,14 @@ int cmd_sd_spi(int argc, char **argv)
     }
 
     int freq_khz = SDMMC_FREQ_DEFAULT;
-    if (take_frequency(argc, argv, 5, &freq_khz) < 0) {
+    int cd_pin = GPIO_NUM_NC;
+    if (take_options(argc, argv, 5, &freq_khz, &cd_pin) < 0) {
         return -1;
     }
     if (!check_pins(pins, 4, names)) {
         return -1;
     }
+    warn_if_bus_held_low(pins, 3, names);   /* CLK, MOSI, MISO -- CS is ours to drive */
     if (frequency_is_reserved(freq_khz)) {
         return -1;
     }
@@ -565,6 +662,7 @@ int cmd_sd_spi(int argc, char **argv)
     cfg.pin_count = 4;
     cfg.width = 1;
     cfg.freq_khz = freq_khz;
+    cfg.cd_pin = cd_pin;
 
     esp_err_t err = open_card();
     if (err != ESP_OK) {
@@ -586,7 +684,8 @@ int cmd_sd_mmc(int argc, char **argv)
     int pins[6];
     int pin_count = 0;
     int index = 1;
-    while (index < argc && pin_count < 6 && strcasecmp(argv[index], "khz") != 0) {
+    while (index < argc && pin_count < 6 &&
+           strcasecmp(argv[index], "khz") != 0 && strcasecmp(argv[index], "cd") != 0) {
         if (parse_int_arg(argv[index], &pins[pin_count]) < 0) {
             bp_error("%s must be a pin number, not '%s'", names[pin_count], argv[index]);
             return -1;
@@ -596,13 +695,14 @@ int cmd_sd_mmc(int argc, char **argv)
     }
 
     if (pin_count != 3 && pin_count != 6) {
-        bp_printf("Usage: mmc <clk> <cmd> <d0> [<d1> <d2> <d3>] [khz <freq>]\n");
+        bp_printf("Usage: mmc <clk> <cmd> <d0> [<d1> <d2> <d3>] [cd <pin>] [khz <freq>]\n");
         bp_error("Give three pins for 1-bit mode or six for 4-bit mode");
         return -1;
     }
 
     int freq_khz = SDMMC_FREQ_DEFAULT;
-    if (take_frequency(argc, argv, index, &freq_khz) < 0) {
+    int cd_pin = GPIO_NUM_NC;
+    if (take_options(argc, argv, index, &freq_khz, &cd_pin) < 0) {
         return -1;
     }
     if (!check_pins(pins, pin_count, names)) {
@@ -611,6 +711,7 @@ int cmd_sd_mmc(int argc, char **argv)
     if (frequency_is_reserved(freq_khz)) {
         return -1;
     }
+    warn_if_bus_held_low(pins, pin_count, names);
 
     teardown();
     cfg.iface = IFACE_MMC;
@@ -618,6 +719,7 @@ int cmd_sd_mmc(int argc, char **argv)
     cfg.pin_count = pin_count;
     cfg.width = (pin_count == 6) ? 4 : 1;
     cfg.freq_khz = freq_khz;
+    cfg.cd_pin = cd_pin;
 
     esp_err_t err = open_card();
     if (err != ESP_OK) {
@@ -653,6 +755,7 @@ int cmd_sd_close(int argc, char **argv)
     teardown();
     cfg.iface = IFACE_NONE;
     cfg.pin_count = 0;
+    cfg.cd_pin = GPIO_NUM_NC;
     bp_printf("SD released.\n");
     return 0;
 }
@@ -661,7 +764,13 @@ int cmd_sd_close(int argc, char **argv)
 /* FAT mount                                                           */
 /* ------------------------------------------------------------------ */
 
-static bool mount_fat(void)
+/*
+ * `quiet` suppresses the bp_error() reporting for callers where a missing
+ * filesystem is not a command failure -- saving the results file is best effort,
+ * and an ERR: line there would tell a host script the benchmark failed when it
+ * did not.
+ */
+static bool mount_fat(bool quiet)
 {
     if (mounted) {
         return true;
@@ -669,7 +778,9 @@ static bool mount_fat(void)
 
     esp_err_t err = ff_diskio_get_drive(&fat_pdrv);
     if (err != ESP_OK || fat_pdrv == 0xFF) {
-        bp_error("No free FATFS drive slot: %s", esp_err_to_name(err));
+        if (!quiet) {
+            bp_error("No free FATFS drive slot: %s", esp_err_to_name(err));
+        }
         fat_pdrv = 0xFF;
         return false;
     }
@@ -685,7 +796,9 @@ static bool mount_fat(void)
     FATFS *fs = NULL;
     err = esp_vfs_fat_register(&conf, &fs);
     if (err != ESP_OK) {
-        bp_error("Registering %s with the VFS: %s", SD_MOUNT_POINT, esp_err_to_name(err));
+        if (!quiet) {
+            bp_error("Registering %s with the VFS: %s", SD_MOUNT_POINT, esp_err_to_name(err));
+        }
         ff_diskio_unregister(fat_pdrv);
         fat_pdrv = 0xFF;
         return false;
@@ -696,9 +809,11 @@ static bool mount_fat(void)
         esp_vfs_fat_unregister_path(SD_MOUNT_POINT);
         ff_diskio_unregister(fat_pdrv);
         fat_pdrv = 0xFF;
-        if (res == FR_NO_FILESYSTEM) {
-            bp_error("The card has no FAT filesystem, so the file benchmark cannot "
-                     "run. 'sd info' and 'sd raw' still work.");
+        if (quiet) {
+            /* nothing: the caller reports it in its own terms */
+        } else if (res == FR_NO_FILESYSTEM) {
+            bp_error("The card has no FAT filesystem. 'sd info' and 'sd raw' still "
+                     "work, but anything needing files does not.");
         } else {
             bp_error("Mounting FAT: FatFs error %d", res);
         }
@@ -707,6 +822,247 @@ static bool mount_fat(void)
 
     mounted = true;
     return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Results file                                                        */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A growable text buffer holding the report as it is produced.
+ *
+ * Results cannot be streamed to the card as they are measured: `sd sweep` tears
+ * the card down and reopens it on every step, which would invalidate any open
+ * file, and `sd raw` runs with no filesystem mounted at all. So the report is
+ * accumulated in RAM and written once, at the end, when the card is settled.
+ */
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} strbuf_t;
+
+static void sb_init(strbuf_t *sb)
+{
+    sb->cap = 1024;
+    sb->len = 0;
+    sb->data = malloc(sb->cap);
+    if (sb->data) {
+        sb->data[0] = '\0';
+    }
+}
+
+static void sb_free(strbuf_t *sb)
+{
+    free(sb->data);
+    sb->data = NULL;
+    sb->len = 0;
+    sb->cap = 0;
+}
+
+static void sb_vprintf(strbuf_t *sb, const char *fmt, va_list args)
+{
+    /* Capture is best effort. If it could not allocate, the console output has
+     * still happened and the measurement is still valid. */
+    if (!sb->data) {
+        return;
+    }
+
+    va_list measure;
+    va_copy(measure, args);
+    int needed = vsnprintf(NULL, 0, fmt, measure);
+    va_end(measure);
+    if (needed < 0) {
+        return;
+    }
+
+    if (sb->len + (size_t)needed + 1 > sb->cap) {
+        size_t cap = sb->cap;
+        while (sb->len + (size_t)needed + 1 > cap) {
+            cap *= 2;
+        }
+        char *grown = realloc(sb->data, cap);
+        if (!grown) {
+            return;
+        }
+        sb->data = grown;
+        sb->cap = cap;
+    }
+
+    vsnprintf(sb->data + sb->len, sb->cap - sb->len, fmt, args);
+    sb->len += (size_t)needed;
+}
+
+/*
+ * Print to the console and capture the identical text for the results file, so
+ * the saved report cannot drift from what was shown on screen.
+ */
+static void tee(strbuf_t *sb, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+
+static void tee(strbuf_t *sb, const char *fmt, ...)
+{
+    va_list console;
+    va_start(console, fmt);
+    va_list captured;
+    va_copy(captured, console);
+
+    bp_vprintf(fmt, console);
+    sb_vprintf(sb, fmt, captured);
+
+    va_end(captured);
+    va_end(console);
+}
+
+/*
+ * Stamp enough identity into the file that a result found on a card months later
+ * can be tied back to the board, the wiring and the card it came from. The
+ * station MAC is the part that is actually unique per board; the chip model and
+ * pin roles say which design and which harness.
+ */
+static void write_run_header(FILE *f, const char *test_name)
+{
+    static const char *const mmc_pin_names[6] = {"CLK", "CMD", "D0", "D1", "D2", "D3"};
+    static const char *const spi_pin_names[4] = {"CLK", "MOSI", "MISO", "CS"};
+
+    esp_chip_info_t chip;
+    esp_chip_info(&chip);
+
+    fprintf(f, "\n================================================================\n");
+    fprintf(f, "%s\n", test_name);
+    fprintf(f, "Uptime:    %llu s when run. The board has no RTC, so entries are in\n"
+               "           file order, not wall-clock order.\n",
+            (unsigned long long)(esp_timer_get_time() / 1000000));
+
+    fprintf(f, "Chip:      %s rev v%d.%d, %d core%s\n",
+            bp_chip_model_name(chip.model), chip.revision / 100, chip.revision % 100,
+            chip.cores, chip.cores == 1 ? "" : "s");
+
+    uint32_t flash_size = 0;
+    if (esp_flash_get_size(NULL, &flash_size) == ESP_OK) {
+        fprintf(f, "Flash:     %" PRIu32 " KB\n", flash_size / 1024);
+    }
+
+    uint8_t mac[6];
+    if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+        fprintf(f, "MAC (STA): %02x:%02x:%02x:%02x:%02x:%02x  <- identifies this board\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+
+    const esp_app_desc_t *app = esp_app_get_description();
+    if (app) {
+        fprintf(f, "Firmware:  %s %s (built %s %s)\n", app->project_name, app->version,
+                app->date, app->time);
+    }
+    fprintf(f, "ESP-IDF:   %s\n", esp_get_idf_version());
+
+    fprintf(f, "Interface: %s on ", iface_name());
+    const char *const *names = (cfg.iface == IFACE_SPI) ? spi_pin_names : mmc_pin_names;
+    for (int i = 0; i < cfg.pin_count; i++) {
+        fprintf(f, "%s%s=GPIO%d", i ? ", " : "", names[i], cfg.pins[i]);
+    }
+    fprintf(f, "\n");
+
+    if (card) {
+        fprintf(f, "Clock:     %.3f MHz (requested %d kHz), card rated %.3f MHz%s\n",
+                card->real_freq_khz / 1000.0, cfg.freq_khz, card->csd.tr_speed / 1e6,
+                card->real_freq_khz * 1000 > card->csd.tr_speed ? "  -- OVERCLOCKED" : "");
+        fprintf(f, "Card:      %.8s, %s, %.2f GiB, CID mfg 0x%02X serial 0x%08X, made %04d-%02d\n",
+                card->cid.name, card_type(),
+                (double)((uint64_t)card->csd.capacity * (uint64_t)card->csd.sector_size) /
+                    (1024.0 * 1024.0 * 1024.0),
+                (unsigned)card->cid.mfg_id, (unsigned)card->cid.serial,
+                2000 + (card->cid.date >> 4), card->cid.date & 0xF);
+    }
+    fprintf(f, "----------------------------------------------------------------\n");
+}
+
+/*
+ * Append the accumulated report to the card.
+ *
+ * Best effort on purpose: the measurement has already succeeded by the time this
+ * runs, so a card with no filesystem, or a full one, gets a note rather than
+ * turning a good result into a failed command.
+ */
+static void results_save(const char *test_name, const strbuf_t *sb)
+{
+    if (!sb->data || sb->len == 0) {
+        return;
+    }
+    if (!mount_fat(/*quiet=*/true)) {
+        bp_printf("Results not saved: the card has no FAT filesystem to write to.\n");
+        return;
+    }
+
+    FILE *f = fopen(SD_RESULTS_FILE, "a");
+    if (!f) {
+        bp_printf("Results not saved: opening %s: %s\n", SD_RESULTS_FILE, strerror(errno));
+        return;
+    }
+
+    write_run_header(f, test_name);
+    bool ok = fwrite(sb->data, 1, sb->len, f) == sb->len;
+    ok = (fflush(f) == 0) && ok;
+    ok = (fsync(fileno(f)) == 0) && ok;
+    fclose(f);
+
+    if (ok) {
+        bp_printf("Results appended to %s\n", SD_RESULTS_FILE);
+    } else {
+        bp_printf("Results not saved: writing %s: %s\n", SD_RESULTS_FILE, strerror(errno));
+    }
+}
+
+/*
+ * Print the results file back, or delete it.
+ *
+ * Worth having because the board is often the only thing holding the card: on a
+ * bringup bench you cannot conveniently pull it and read it on a host, and
+ * without this the saved file could not be checked at all.
+ */
+int cmd_sd_results(int argc, char **argv)
+{
+    if (!require_card()) {
+        return -1;
+    }
+    if (!mount_fat(/*quiet=*/false)) {
+        return -1;
+    }
+
+    if (argc > 1) {
+        if (strcasecmp(argv[1], "clear") != 0) {
+            bp_printf("Usage: results [clear]\n");
+            return -1;
+        }
+        if (unlink(SD_RESULTS_FILE) != 0) {
+            if (errno == ENOENT) {
+                bp_printf("No results file to clear.\n");
+                return 0;
+            }
+            bp_error("Removing %s: %s", SD_RESULTS_FILE, strerror(errno));
+            return -1;
+        }
+        bp_printf("Cleared %s\n", SD_RESULTS_FILE);
+        return 0;
+    }
+
+    FILE *f = fopen(SD_RESULTS_FILE, "r");
+    if (!f) {
+        if (errno == ENOENT) {
+            bp_printf("No results saved yet. Run 'sd bench', 'sd raw' or 'sd sweep'.\n");
+            return 0;
+        }
+        bp_error("Opening %s: %s", SD_RESULTS_FILE, strerror(errno));
+        return -1;
+    }
+
+    char chunk[256];
+    size_t got;
+    while ((got = fread(chunk, 1, sizeof(chunk) - 1, f)) > 0) {
+        chunk[got] = '\0';
+        bp_write(chunk, got);
+    }
+    fclose(f);
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -727,20 +1083,20 @@ typedef struct {
  * board that has to keep up with a sensor or a camera, that worst case is the
  * number that decides whether the design works, and an average hides it.
  */
-static void report(const char *label, const bench_result_t *r, size_t block_bytes)
+static void report(strbuf_t *sb, const char *label, const bench_result_t *r, size_t block_bytes)
 {
     double seconds = (double)r->elapsed_us / 1e6;
     double kib = (double)r->bytes / 1024.0;
 
     if (seconds <= 0.0) {
-        bp_printf("%-6s %6.0f KiB in under 1 us -- too small to measure\n", label, kib);
+        tee(sb, "%-6s %6.0f KiB in under 1 us -- too small to measure\n", label, kib);
         return;
     }
 
-    bp_printf("%-6s %6.0f KiB in %7.3f s = %8.1f KiB/s (%.2f MiB/s), "
-              "worst %u KiB block %.1f ms\n",
-              label, kib, seconds, kib / seconds, kib / seconds / 1024.0,
-              (unsigned)(block_bytes / 1024), (double)r->worst_block_us / 1000.0);
+    tee(sb, "%-6s %6.0f KiB in %7.3f s = %8.1f KiB/s (%.2f MiB/s), "
+            "worst %u KiB block %.1f ms\n",
+        label, kib, seconds, kib / seconds, kib / seconds / 1024.0,
+        (unsigned)(block_bytes / 1024), (double)r->worst_block_us / 1000.0);
 }
 
 /* Fill a block with a position-dependent pattern, stamped with the block index
@@ -765,7 +1121,7 @@ int cmd_sd_bench(int argc, char **argv)
     if (take_sizes(argc, argv, 1, &total_bytes, &block_bytes) < 0) {
         return -1;
     }
-    if (!mount_fat()) {
+    if (!mount_fat(/*quiet=*/false)) {
         return -1;
     }
 
@@ -781,9 +1137,12 @@ int cmd_sd_bench(int argc, char **argv)
         return -1;
     }
 
-    bp_printf("FAT benchmark on %s: %u KiB in %u KiB blocks over %s at %.3f MHz\n",
-              SD_BENCH_FILE, (unsigned)(total_bytes / 1024),
-              (unsigned)(block_bytes / 1024), iface_name(), card->real_freq_khz / 1000.0);
+    strbuf_t sb;
+    sb_init(&sb);
+
+    tee(&sb, "FAT benchmark on %s: %u KiB in %u KiB blocks over %s at %.3f MHz\n",
+        SD_BENCH_FILE, (unsigned)(total_bytes / 1024),
+        (unsigned)(block_bytes / 1024), iface_name(), card->real_freq_khz / 1000.0);
 
     int result = -1;
     bench_result_t write_result = {0};
@@ -829,8 +1188,8 @@ int cmd_sd_bench(int argc, char **argv)
         goto cleanup_file;
     }
 
-    report("Write", &write_result, block_bytes);
-    bp_printf("       final flush %.1f ms\n", (double)flush_us / 1000.0);
+    report(&sb, "Write", &write_result, block_bytes);
+    tee(&sb, "       final flush %.1f ms\n", (double)flush_us / 1000.0);
 
     f = fopen(SD_BENCH_FILE, "rb");
     if (!f) {
@@ -866,9 +1225,9 @@ int cmd_sd_bench(int argc, char **argv)
     }
     fclose(f);
 
-    report("Read", &read_result, block_bytes);
-    bp_printf("Data verified: %u KiB read back byte-for-byte.\n",
-              (unsigned)(read_result.bytes / 1024));
+    report(&sb, "Read", &read_result, block_bytes);
+    tee(&sb, "Data verified: %u KiB read back byte-for-byte.\n",
+        (unsigned)(read_result.bytes / 1024));
     result = 0;
 
 cleanup_file:
@@ -880,6 +1239,10 @@ cleanup_file:
     }
 
 done:
+    if (result == 0) {
+        results_save("SD card FAT filesystem benchmark", &sb);
+    }
+    sb_free(&sb);
     free(pattern);
     free(readback);
     return result;
@@ -937,9 +1300,12 @@ int cmd_sd_raw(int argc, char **argv)
      * interface without the filesystem's allocation and metadata overhead in
      * the way -- the difference between this and `sd bench` is what FAT costs.
      */
-    bp_printf("Raw read of %u KiB from sector %d in %u KiB blocks over %s at %.3f MHz\n",
-              (unsigned)(blocks * block_bytes / 1024), start_sector,
-              (unsigned)(block_bytes / 1024), iface_name(), card->real_freq_khz / 1000.0);
+    strbuf_t sb;
+    sb_init(&sb);
+
+    tee(&sb, "Raw read of %u KiB from sector %d in %u KiB blocks over %s at %.3f MHz\n",
+        (unsigned)(blocks * block_bytes / 1024), start_sector,
+        (unsigned)(block_bytes / 1024), iface_name(), card->real_freq_khz / 1000.0);
 
     bench_result_t result = {0};
     for (uint32_t i = 0; i < blocks; i++) {
@@ -952,6 +1318,7 @@ int cmd_sd_raw(int argc, char **argv)
         if (err != ESP_OK) {
             bp_error("Reading %u sectors at %u: %s", (unsigned)sectors_per_block,
                      (unsigned)sector, esp_err_to_name(err));
+            sb_free(&sb);
             free(buffer);
             return -1;
         }
@@ -962,8 +1329,10 @@ int cmd_sd_raw(int argc, char **argv)
         }
     }
 
-    report("Read", &result, block_bytes);
+    report(&sb, "Read", &result, block_bytes);
     free(buffer);
+    results_save("SD card raw sector read benchmark", &sb);
+    sb_free(&sb);
     return 0;
 }
 
@@ -1087,9 +1456,14 @@ int cmd_sd_sweep(int argc, char **argv)
         return -1;
     }
 
-    bp_printf("Clock sweep over %s, %u KiB read per step from sector 0.\n",
-              iface_name(), (unsigned)(blocks * block_bytes / 1024));
-    bp_printf("Read-only: nothing is written to the card at an unverified clock.\n");
+    strbuf_t sb;
+    sb_init(&sb);
+
+    tee(&sb, "Clock sweep over %s, %u KiB read per step from sector 0.\n",
+        iface_name(), (unsigned)(blocks * block_bytes / 1024));
+    tee(&sb, "Measurement is read-only: nothing is written to the card at a clock\n"
+             "that has not been verified. The results file is written at the end,\n"
+             "at the fastest rate that passed.\n");
 
     /*
      * The drivers log the same lines on every single init, and the sweep does
@@ -1139,13 +1513,27 @@ int cmd_sd_sweep(int argc, char **argv)
         goto done;
     }
 
-    const int rated_khz = card->csd.tr_speed / 1000;
-    bp_printf("Reference CRC 0x%08X, stable over two passes. Card is rated for "
-              "%.3f MHz.\n\n", (unsigned)reference_crc, rated_khz / 1000.0);
-    bp_printf("  Requested     Actual   Read speed   Result\n");
+    /*
+     * The card's rated speed is not a constant, so it has to be re-read at every
+     * step rather than captured once here.
+     *
+     * ESP-IDF only attempts the CMD6 high-speed switch when the host asks for
+     * more than 20 MHz (sdmmc_enable_hs_mode_and_check). Below that the card is
+     * left in Default Speed and its CSD reports 25 MHz; once switched, the CSD
+     * is re-read and reports 50 MHz. Comparing every step against the rating
+     * seen at the 20 MHz reference would therefore label perfectly in-spec
+     * High Speed operation as overclocking.
+     */
+    const int baseline_rated_khz = card->csd.tr_speed / 1000;
+    tee(&sb, "Reference CRC 0x%08X, stable over two passes. Card is rated for "
+             "%.3f MHz at default speed;\nthat rises if it accepts the high-speed "
+             "switch, which is only attempted above %d kHz.\n\n",
+        (unsigned)reference_crc, baseline_rated_khz / 1000.0, SWEEP_BASELINE_KHZ);
+    tee(&sb, "  Requested     Actual   Read speed   Result\n");
 
     int best_requested_khz = 0;
     int best_actual_khz = 0;
+    int best_rated_khz = baseline_rated_khz;
     double best_kib_s = 0.0;
     int previous_actual_khz = -1;
     int consecutive_failures = 0;
@@ -1162,23 +1550,26 @@ int cmd_sd_sweep(int argc, char **argv)
         cfg.freq_khz = requested;
         err = open_card();
         if (err != ESP_OK) {
-            bp_printf("  %7d kHz          -            -   init failed: %s\n",
-                      requested, esp_err_to_name(err));
+            tee(&sb, "  %7d kHz          -            -   init failed: %s\n",
+                requested, esp_err_to_name(err));
             if (!first_failure_khz) {
                 first_failure_khz = requested;
             }
             if (++consecutive_failures >= SWEEP_MAX_CONSECUTIVE_FAILURES) {
-                bp_printf("  ... stopping after %d consecutive failures.\n",
-                          consecutive_failures);
+                tee(&sb, "  ... stopping after %d consecutive failures.\n",
+                    consecutive_failures);
                 break;
             }
             continue;
         }
 
         const int actual = card->real_freq_khz;
+        /* Re-read: a step that entered high-speed mode is rated higher than the
+         * same card was at the reference rate. */
+        const int step_rated_khz = card->csd.tr_speed / 1000;
         if (actual == previous_actual_khz) {
-            bp_printf("  %7d kHz  %7.3f MHz            -   same clock as the previous "
-                      "step, skipped\n", requested, actual / 1000.0);
+            tee(&sb, "  %7d kHz  %7.3f MHz            -   same clock as the previous "
+                "step, skipped\n", requested, actual / 1000.0);
             if (++consecutive_duplicates >= SWEEP_MAX_CONSECUTIVE_DUPLICATES) {
                 host_clamped = true;
                 break;
@@ -1193,22 +1584,23 @@ int cmd_sd_sweep(int argc, char **argv)
         err = read_crc(buffer, block_bytes, blocks, sectors_per_block, &crc, &timing);
 
         if (err != ESP_OK) {
-            bp_printf("  %7d kHz  %7.3f MHz            -   read failed: %s\n",
-                      requested, actual / 1000.0, esp_err_to_name(err));
+            tee(&sb, "  %7d kHz  %7.3f MHz            -   read failed: %s\n",
+                requested, actual / 1000.0, esp_err_to_name(err));
         } else if (crc != reference_crc) {
             /* This is the failure mode that matters: the transfer "succeeded"
              * and returned corrupt data. Without the CRC it would have been
              * recorded as a pass with a very good throughput figure. */
-            bp_printf("  %7d kHz  %7.3f MHz   %8.1f KiB/s   DATA MISMATCH (CRC 0x%08X)\n",
-                      requested, actual / 1000.0, throughput_kib_s(&timing), (unsigned)crc);
+            tee(&sb, "  %7d kHz  %7.3f MHz   %8.1f KiB/s   DATA MISMATCH (CRC 0x%08X)\n",
+                requested, actual / 1000.0, throughput_kib_s(&timing), (unsigned)crc);
         } else {
             const double kib_s = throughput_kib_s(&timing);
-            bp_printf("  %7d kHz  %7.3f MHz   %8.1f KiB/s   ok%s\n",
-                      requested, actual / 1000.0, kib_s,
-                      actual > rated_khz ? "  (overclocked)" : "");
+            tee(&sb, "  %7d kHz  %7.3f MHz   %8.1f KiB/s   ok%s\n",
+                requested, actual / 1000.0, kib_s,
+                actual > step_rated_khz ? "  (overclocked)" : "");
             if (actual > best_actual_khz) {
                 best_requested_khz = requested;
                 best_actual_khz = actual;
+                best_rated_khz = step_rated_khz;
                 best_kib_s = kib_s;
             }
             consecutive_failures = 0;
@@ -1219,42 +1611,45 @@ int cmd_sd_sweep(int argc, char **argv)
             first_failure_khz = requested;
         }
         if (++consecutive_failures >= SWEEP_MAX_CONSECUTIVE_FAILURES) {
-            bp_printf("  ... stopping after %d consecutive failures.\n", consecutive_failures);
+            tee(&sb, "  ... stopping after %d consecutive failures.\n", consecutive_failures);
             break;
         }
     }
 
-    bp_printf("\n");
+    tee(&sb, "\n");
     if (best_actual_khz == 0) {
         bp_error("No rate passed, not even the %d kHz reference.", SWEEP_BASELINE_KHZ);
         cfg.freq_khz = entry_freq_khz;
     } else {
-        bp_printf("Fastest verified: %.3f MHz at %.1f KiB/s (%.2f MiB/s), %.2fx the "
-                  "reference.\n", best_actual_khz / 1000.0, best_kib_s,
-                  best_kib_s / 1024.0,
-                  throughput_kib_s(&reference_timing) > 0.0
-                      ? best_kib_s / throughput_kib_s(&reference_timing) : 0.0);
+        tee(&sb, "Fastest verified: %.3f MHz at %.1f KiB/s (%.2f MiB/s), %.2fx the "
+                 "reference.\n", best_actual_khz / 1000.0, best_kib_s,
+            best_kib_s / 1024.0,
+            throughput_kib_s(&reference_timing) > 0.0
+                ? best_kib_s / throughput_kib_s(&reference_timing) : 0.0);
         if (first_failure_khz) {
-            bp_printf("First failure:    %d kHz requested.\n", first_failure_khz);
+            tee(&sb, "First failure:    %d kHz requested.\n", first_failure_khz);
         } else if (host_clamped) {
             /*
              * Not the same thing as "the card is happy up here". Every larger
              * request produced the identical clock, so the card was never
              * actually driven any faster and its own limit is still unknown.
              */
-            bp_printf("Limited by the host, not the card: every request above %d kHz "
-                      "produced the same %.3f MHz, so the card was never clocked any "
-                      "faster than that. %s cannot drive it harder on this interface.\n",
-                      best_requested_khz, best_actual_khz / 1000.0, CONFIG_IDF_TARGET);
+            tee(&sb, "Limited by the host, not the card: every request above %d kHz "
+                     "produced the same %.3f MHz, so the card was never clocked any "
+                     "faster than that. %s cannot drive it harder on this interface.\n",
+                best_requested_khz, best_actual_khz / 1000.0, CONFIG_IDF_TARGET);
         } else {
-            bp_printf("No failures up to the %d kHz ceiling that was asked for; raise "
-                      "it to look further.\n", max_khz);
+            tee(&sb, "No failures up to the %d kHz ceiling that was asked for; raise "
+                     "it to look further.\n", max_khz);
         }
-        if (best_actual_khz > rated_khz) {
-            bp_printf("This is %.3f MHz above the card's rated %.3f MHz. Passing one "
-                      "read sweep is not a stability guarantee: overclocking is out of "
-                      "spec, and margin varies with temperature, supply and wiring.\n",
-                      (best_actual_khz - rated_khz) / 1000.0, rated_khz / 1000.0);
+        if (best_actual_khz > best_rated_khz) {
+            tee(&sb, "This is %.3f MHz above the card's rated %.3f MHz. Passing one "
+                     "read sweep is not a stability guarantee: overclocking is out of "
+                     "spec, and margin varies with temperature, supply and wiring.\n",
+                (best_actual_khz - best_rated_khz) / 1000.0, best_rated_khz / 1000.0);
+        } else {
+            tee(&sb, "Within spec: the card is rated for %.3f MHz at this setting, so "
+                     "nothing here was an overclock.\n", best_rated_khz / 1000.0);
         }
         cfg.freq_khz = best_requested_khz;
         result = 0;
@@ -1268,12 +1663,16 @@ int cmd_sd_sweep(int argc, char **argv)
                  esp_err_to_name(err));
         result = -1;
     } else {
-        bp_printf("Card re-initialized at %.3f MHz.\n", card->real_freq_khz / 1000.0);
+        tee(&sb, "Card re-initialized at %.3f MHz.\n", card->real_freq_khz / 1000.0);
+        /* Only now, back at a rate that passed verification, is it safe to put
+         * anything on the card. */
+        results_save("SD card clock sweep / overclocking test", &sb);
     }
 
 done:
     esp_log_level_set("SD_HOST", ESP_LOG_WARN);
     esp_log_level_set("sdspi_transaction", ESP_LOG_INFO);
+    sb_free(&sb);
     free(buffer);
     return result;
 }

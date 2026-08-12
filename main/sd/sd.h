@@ -9,6 +9,7 @@ int cmd_sd_info(int argc, char **argv);
 int cmd_sd_bench(int argc, char **argv);
 int cmd_sd_raw(int argc, char **argv);
 int cmd_sd_sweep(int argc, char **argv);
+int cmd_sd_results(int argc, char **argv);
 int cmd_sd_close(int argc, char **argv);
 
 /*

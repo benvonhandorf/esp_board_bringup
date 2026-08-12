@@ -24,7 +24,7 @@
  * 100 cycles of 32kHz is about 3ms. */
 #define LFXTAL_CAL_CYCLES 100
 
-static const char *chip_model_name(esp_chip_model_t model)
+const char *bp_chip_model_name(esp_chip_model_t model)
 {
     switch (model) {
     case CHIP_ESP32:    return "ESP32";
@@ -84,7 +84,7 @@ int cmd_system_info(int argc, char **argv)
     esp_chip_info(&info);
 
     bp_printf("Chip:      %s rev v%d.%d, %d core%s\n",
-              chip_model_name(info.model),
+              bp_chip_model_name(info.model),
               info.revision / 100, info.revision % 100,
               info.cores, info.cores == 1 ? "" : "s");
 

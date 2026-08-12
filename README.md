@@ -58,10 +58,15 @@ Sets the specified pin(s) to the requested state.  If pin is not already configu
 - true, 1, high: pin will be set high
 - false, 0, low: pin will be set low
 
-#### `read <pin>`
+#### `read <pin> [up|down|none]`
 
 Returns a list of the specified pins and their logic levels.  If pin is not already configured as an input pin, it will be configured at this time.
 Output will be one pin number per row, followed by a 0 or 1 indicating the logic level of the pin.
+
+The optional internal pull defaults to `none`, which is what a bare `read` has
+always done. `up` is the useful one during bringup: without a pull, a pin that is
+driven low and a pin that is connected to nothing both tend to read 0. With the
+pull-up fighting it, anything still reading 0 is genuinely being held down.
 
 Sample: `gpio read 1,4` when GPIO 1 is low and GPIO 4 is high.
 Output:
@@ -80,6 +85,50 @@ in eFuse, the equivalent voltage in millivolts are reported.
 
 Blinks the specified pin LED count times for visual testing. The period defaults
 to 500 ms. Accepts pin lists like the other GPIO commands.
+
+#### `short <pin>`
+
+Finds pins that are shorted together. Give it the pins to test — the same
+`4`, `0-5` or `1,4,8-10` forms as every other GPIO command — and it drives each
+one low in turn while reading the others with pull-ups enabled. A pin that
+follows another down shares a net with it.
+
+**Adjacent pins are tested and reported first.** A solder bridge at the package
+is far and away the most common way two nets get tied together, and neighbouring
+GPIO numbers are usually neighbouring pads, so that is the answer worth seeing
+before a wall of results. (Usually, not always — GPIO numbering does not track
+the package outline exactly, so the full matrix follows.)
+
+A short is only reported when **both** pins pull each other down. The symmetry
+requirement matters: a pin held low by the board — a grounded net, a card-detect
+switch, an output driving low — follows everything and fights nothing, and a
+naive rule reports it as shorted to every pin in the list. Those are listed
+separately as untestable instead.
+
+Pins that must never be driven are skipped with the reason given: flash and PSRAM
+pins, the USB or UART console pins, and anything a peripheral currently holds.
+The first group would hang the chip and the second would cut off the connection
+these results are printed to; ESP-IDF's own `esp_gpio_is_reserved()` supplies the
+list, so it stays right per chip and per board configuration.
+
+Because it drives every pin listed, do not run it against a bus another device
+may be driving at the same time. Pins are left as passive inputs afterwards.
+
+Sample, on a board where D0 and SCK of an SD slot were bridged at the pads:
+
+```
+> gpio short 38-44
+Adjacent pins (where a solder bridge usually lands):
+  GPIO 39 <-> GPIO 40   SHORTED
+Remaining pairs:
+  15 pairs tested, all clear
+Held low whatever is driven, so not testable and not a short:
+  GPIO 44
+```
+
+That short stalled SD card init in a way that looked nothing like a wiring
+fault — the host never got its clock started, because it waits for the data bus
+to go idle and every CLK low was dragging D0 down with it.
 
 #### PWM
 
@@ -391,7 +440,8 @@ they say whether the interface or the card is the limit.
 #### `bench [size_kb] [block_kb]`
 
 Mounts FAT if it is not already mounted, then writes, reads back and deletes
-`/sd/bench.tmp`. Defaults to 512 KB in 16 KB blocks.
+`/sd/bench.tmp`. Defaults to 512 KB in 16 KB blocks. The result is appended to
+the results file described below.
 
 The write measurement includes the final flush. Without it the card is still
 absorbing the tail of the data when the clock stops, and the figure reported is
@@ -407,8 +457,10 @@ the card.
 Reads whole sectors straight off the card with no filesystem in the way. The
 gap between this and `bench` is what FAT costs.
 
-It is read-only, so it is safe to run anywhere on the card. Blocks are rounded
-down to whole sectors and the range is checked against the card's capacity.
+The read is read-only, so it is safe to run anywhere on the card. Blocks are
+rounded down to whole sectors and the range is checked against the card's
+capacity. The result is appended to the results file described below, which is
+the one write it does make.
 
 #### `sweep [max_khz] [size_kb] [block_kb]`
 
@@ -428,8 +480,10 @@ reproduce its own data in spec makes every later comparison meaningless, and
 that is worth saying outright rather than deriving an overclocking limit from
 noise.
 
-It is **read-only**. Nothing is written to the card at a clock that has not been
-verified, because a corrupt write is not recoverable the way a corrupt read is.
+The measurement is **read-only**. Nothing is written to the card at a clock that
+has not been verified, because a corrupt write is not recoverable the way a
+corrupt read is. The results file is written afterwards, once the card has been
+reopened at the fastest rate that passed.
 
 Two things the report is careful to distinguish:
 
@@ -445,12 +499,63 @@ Steps that pass above the card's CSD-rated speed are marked `(overclocked)`.
 Passing one read sweep is not a stability guarantee — it is out of spec, and the
 margin varies with temperature, supply and wiring.
 
+The rating is re-read at every step rather than measured once, because it is not
+constant. ESP-IDF only attempts the CMD6 high-speed switch when the host asks
+for more than 20 MHz; below that the card stays in Default Speed and reports
+25 MHz, and after the switch it reports 50 MHz. Comparing every step against the
+figure seen at the 20 MHz reference would label perfectly in-spec High Speed
+operation as overclocking.
+
 Afterwards the card is left initialized at the fastest verified rate, so
 `sd bench` and `sd raw` measure it without re-entering anything.
+
+#### `results [clear]`
+
+Prints the saved results file back, or with `clear` deletes it. Worth having
+because on a bringup bench the board is usually the only thing holding the card,
+so there is no convenient way to pull it and read the file on a host.
 
 #### `close`
 
 Unmounts, releases the card and frees the bus.
+
+#### The results file
+
+`bench`, `raw` and `sweep` each append their output to **`/sd/sdbench.txt`** when
+they succeed. Nothing is overwritten, so a card accumulates a history and can be
+carried between boards.
+
+Each entry is stamped with enough identity to say where it came from, which is
+the point — a bare table of numbers found on a card months later is worthless:
+
+```
+================================================================
+SD card clock sweep / overclocking test
+Uptime:    25 s when run. The board has no RTC, so entries are in
+           file order, not wall-clock order.
+Chip:      ESP32-S3 rev v0.2, 2 cores
+Flash:     8192 KB
+MAC (STA): d8:3b:da:45:4c:ec  <- identifies this board
+Firmware:  esp_board_bringup 3500f4b-dirty (built Aug 12 2026 10:44:18)
+ESP-IDF:   v6.0.1
+Interface: SPI on CLK=GPIO7, MOSI=GPIO9, MISO=GPIO8, CS=GPIO21
+Clock:     20.000 MHz (requested 20000 kHz), card rated 25.000 MHz
+Card:      SD04G, SDHC/SDXC, 3.68 GiB, CID mfg 0x27 serial 0x7C559EEF, made 2015-05
+----------------------------------------------------------------
+```
+
+The station MAC is the part that is genuinely unique per board; the chip model
+and revision say which design, and the pins are named by role so the wiring
+harness is recorded too. For a sweep, the whole rate-by-rate table follows,
+including which steps were overclocked and where it stopped and why.
+
+The body is captured with the same formatting calls that produced the console
+output, so what is saved cannot drift from what was displayed.
+
+Saving is **best effort**. The measurement has already succeeded by the time the
+file is written, so a card with no filesystem produces a plain note rather than
+an `ERR:` line — a host script parsing `ERR:` should not be told a good
+benchmark failed because there was nowhere to record it.
 
 #### Reported numbers
 
@@ -476,7 +581,9 @@ Measured on the board this was developed against, a XIAO ESP32-S3 Sense with a
 | Worst write block | 27.7 ms | 849.5 ms | 33.7 ms |
 
 `sd sweep` found the limits to be 20 MHz over SPI and 40 MHz over SD 1-bit. Both
-are worth understanding, because neither is the card:
+are worth understanding, because neither is the card — and neither is an
+overclock, despite 40 MHz being above the 25 MHz the card advertises at default
+speed:
 
 - **Over SPI it stops at 20 MHz.** At 24 MHz and above, initialization fails in
   `sdmmc_enable_hs_mode_and_check()` re-reading the CSD, and command CRC errors
@@ -490,8 +597,10 @@ are worth understanding, because neither is the card:
   is a fixed divider rather than a negotiated rate. ESP-IDF's
   `sd_host_slot_get_clk_dividers()` maps *every* request of 40 MHz or more onto
   `host_div = 4`, i.e. 160 MHz / 4 = exactly 40 MHz, so the card was never
-  driven faster and its own limit is unknown. See the note below. The card was
-  still 15 MHz above its rated 25 MHz and read correctly throughout.
+  driven faster and its own limit is unknown. See the note below.
+
+  Note that 40 MHz is **not** an overclock for this card: once it accepts the
+  high-speed switch its CSD reports 50 MHz, so the whole sweep ran in spec.
 
 ##### Why 40 MHz is the SD-mode ceiling
 

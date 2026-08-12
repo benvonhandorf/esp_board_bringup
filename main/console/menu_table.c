@@ -33,9 +33,10 @@ static const bp_menu_t system_menu = {
 
 static const bp_command_t gpio_commands[] = {
     {"set", "<pin> <state>", "Drive pin(s) high or low", cmd_gpio_set},
-    {"read", "<pin>", "Read the logic level of pin(s)", cmd_gpio_read},
+    {"read", "<pin> [up|down|none]", "Read the logic level of pin(s)", cmd_gpio_read},
     {"aread", "<pin>", "Read pin(s) with the ADC", cmd_gpio_aread},
     {"blink", "<pin> <count> [ms]", "Blink pin(s) for visual identification", cmd_gpio_blink},
+    {"short", "<pin>", "Find pins shorted together, adjacent pairs first", cmd_gpio_short},
 };
 
 static const bp_command_t pwm_commands[] = {
@@ -151,12 +152,13 @@ static const bp_menu_t spi_menu = {
 };
 
 static const bp_command_t sd_commands[] = {
-    {"spi", "<clk> <mosi> <miso> <cs> [khz <freq>]", "Bring a card up over SPI", cmd_sd_spi},
-    {"mmc", "<clk> <cmd> <d0> [<d1> <d2> <d3>] [khz <freq>]", "Bring a card up in 1-bit or 4-bit SD mode", cmd_sd_mmc},
+    {"spi", "<clk> <mosi> <miso> <cs> [cd <pin>] [khz <freq>]", "Bring a card up over SPI", cmd_sd_spi},
+    {"mmc", "<clk> <cmd> <d0> [<d1> <d2> <d3>] [cd <pin>] [khz <freq>]", "Bring a card up in 1-bit or 4-bit SD mode", cmd_sd_mmc},
     {"info", "", "Report the detected card", cmd_sd_info},
     {"bench", "[size_kb] [block_kb]", "Measure write and read speed through FAT", cmd_sd_bench},
     {"raw", "[size_kb] [block_kb] [start_sector]", "Measure read speed with no filesystem", cmd_sd_raw},
     {"sweep", "[max_khz] [size_kb] [block_kb]", "Find the fastest clock the card reads correctly at", cmd_sd_sweep},
+    {"results", "[clear]", "Show or delete the saved results file", cmd_sd_results},
     {"close", "", "Unmount, release the card and free the bus", cmd_sd_close},
 };
 
