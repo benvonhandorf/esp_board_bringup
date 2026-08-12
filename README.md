@@ -130,6 +130,71 @@ That short stalled SD card init in a way that looked nothing like a wiring
 fault — the host never got its clock started, because it waits for the data bus
 to go idle and every CLK low was dragging D0 down with it.
 
+#### `rc <pin>`
+
+Measures the **pull-up strength and capacitance of each net**. `short` answers
+"are these two nets the same net"; this answers "is this net pulled up, how
+hard, and how much is hanging off it" — which a logic read cannot, because a
+10k pull-up to a healthy rail and a 10k pull-up whose far end is floating both
+read as `1`.
+
+It drives the pin low, releases it, and times the rise. The net charges through
+whatever pulls it up, so the rise is R×C. Measuring twice, the second time with
+the internal pull-up (~45k) added in parallel, gives two equations for the two
+unknowns and uses the on-chip pull-up as the reference:
+
+```
+t_ext = k·R_ext·C        t_par = k·(R_ext ‖ R_int)·C
+t_ext / t_par = (R_ext + R_int) / R_int
+```
+
+so `R_ext = R_int · (t_ext/t_par − 1)`, and `C` follows. No meter needed.
+
+The internal pull-up is only nominally 45k and varies widely with process and
+temperature, so both results are worth about a factor of two. That is enough:
+the cases this separates differ by orders of magnitude. A signal net is single
+-digit pF; a net tied to an unpowered rail's decoupling capacitor is tens of nF.
+
+Timing is done by releasing the pad and sampling it once at a chosen delay,
+binary-searching for the crossing, with the delay-to-sample cost calibrated out
+by driving the same pin push-pull. Polling `gpio_get_level()` in a loop instead
+only resolves one iteration — about 290 ns here, the same order as the rise
+being measured, which quantises every net to the same two numbers.
+
+Sample, on the SD slot of an ESP32-S3 board:
+
+```
+> gpio rc 38-44
+ pin    external   with int    pull-up      net C
+  38      650 ns      244 ns    75.0 k      6.3 pF
+  39      650 ns      256 ns    69.1 k      6.8 pF
+  40        none      462 ns       none      7.4 pF  no external pull-up
+  41      650 ns      275 ns    61.4 k      7.6 pF
+  42      356 ns      200 ns    35.2 k      7.3 pF
+  43      650 ns      269 ns    63.8 k      7.3 pF
+  44          --         --         --         --  held low, or >80nF
+```
+
+Reading that: GPIO40 is SD CLK, which correctly has no pull-up; GPIO44 is
+card detect, held low by the switch with a card in. The rest sit at 60–75k
+except D3 at 35k — the signature of an SD card's *own* internal pull-ups
+rather than the board's, since cards pull up CMD and DAT0–3 but never CLK,
+and DAT3's is deliberately stronger for card detection. Pulling the card and
+re-running is what tells the two apart. Every net measures ~7 pF, which is a
+bare pin and a short trace: nothing unexpected is hanging off the bus.
+
+Two independent methods agree on that ~7 pF — GPIO40 gets it from the known
+45k internal pull-up alone, the others from the two-point solve — which is a
+useful self-check that the numbers mean something.
+
+Holding the other lines low with `gpio set` and re-measuring one of them is a
+way to ask whether a rail is real: if a net's pull-up is being fed parasitically
+through its neighbours, collapsing them changes the answer. If it does not
+budge, the rail is genuinely sourced.
+
+Same cautions as `short`: it drives the pin, so nothing else may be driving it,
+and interrupts are masked for up to 5 ms per sample.
+
 #### PWM
 
 Reached as `gpio pwm ...`, or by entering the `gpio` menu and then `pwm`.

@@ -521,17 +521,27 @@ static void explain_init_timeout(esp_err_t err)
         return;
     }
     bp_printf("      Timed out initializing. Check the log lines above for where:\n");
-    bp_printf("      - 'sdmmc_init_ocr ... send_op_cond' means the card answered the\n");
-    bp_printf("        first commands but never finished powering up. Usually it is\n");
-    bp_printf("        latched in SPI mode from an earlier 'sd spi' -- a card leaves\n");
-    bp_printf("        SPI mode only when its power is removed, and a board reset\n");
-    bp_printf("        does not do that. Unplug and replug the board. Failing that,\n");
-    bp_printf("        reseat the card, or try a different one.\n");
     bp_printf("      - 'clock_update_command' or 'failed to set clk' means the host\n");
     bp_printf("        never even got its clock running. It waits for the data bus to\n");
     bp_printf("        go idle before accepting that command, so a CMD or D0 line held\n");
     bp_printf("        low stalls it here. That is wiring, not the card: check the\n");
-    bp_printf("        pins with 'gpio read <pins> up'.\n");
+    bp_printf("        pins with 'gpio short' and 'gpio rc'.\n");
+    bp_printf("      - 'sdmmc_init_ocr ... send_op_cond' is ACMD41, and reaching it\n");
+    bp_printf("        means the card already answered CMD0 and CMD8 correctly, CRC\n");
+    bp_printf("        included. So the clock and command wiring work; what failed is\n");
+    bp_printf("        the card's own power-up ramp, which it reports as 'still busy'\n");
+    bp_printf("        for the full three seconds of retries. Three things do that:\n");
+    bp_printf("          * The card is latched in SPI mode from an earlier 'sd spi'.\n");
+    bp_printf("            It leaves SPI mode only when its power is removed, which a\n");
+    bp_printf("            board reset does not do -- unplug and replug the board.\n");
+    bp_printf("          * Its supply cannot carry the power-up current. Talking takes\n");
+    bp_printf("            a milliamp and ramping takes a hundred, so a weak or\n");
+    bp_printf("            missing VDD looks exactly like this. Measure VDD at the\n");
+    bp_printf("            socket during the attempt, not just at idle.\n");
+    bp_printf("          * The card is failing. Try a known-good one.\n");
+    bp_printf("        Retrying over the other interface separates card from wiring:\n");
+    bp_printf("        SD mode and SPI mode share almost no logic, so a card that\n");
+    bp_printf("        stops here on both has a supply or a card problem.\n");
 }
 
 /*

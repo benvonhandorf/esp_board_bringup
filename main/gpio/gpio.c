@@ -3,8 +3,11 @@
 #include "gpio.h"
 
 #include "driver/gpio.h"
+#include "esp_cpu.h"
+#include "esp_private/esp_clk.h"
 #include "esp_private/esp_gpio_reserve.h"
 #include "esp_rom_sys.h"
+#include "soc/gpio_reg.h"
 #include "soc/io_mux_reg.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
@@ -571,4 +574,274 @@ int cmd_gpio_short(int argc, char **argv)
     free(observed);
     free(pins);
     return total_shorts ? -1 : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Pull-up and capacitance measurement                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * `gpio short` answers "are these two nets the same net". It cannot answer
+ * "is this net pulled up, how hard, and how much is hanging off it" -- and a
+ * logic read cannot either, because a 10k pull-up to a healthy rail and a 10k
+ * pull-up whose far end is floating both read as 1.
+ *
+ * Releasing a pin that was driven low and timing the rise separates them. The
+ * net charges through whatever pulls it up, so the rise time is R*C. Doing it
+ * twice, once with the internal pull-up added in parallel, gives two equations
+ * for the two unknowns, using the internal pull-up as an on-chip reference:
+ *
+ *   t_ext = k * R_ext * C            t_par = k * (R_ext || R_int) * C
+ *   t_ext / t_par = (R_ext + R_int) / R_int
+ *
+ * so R_ext = R_int * (t_ext / t_par - 1), and C follows. No meter needed.
+ *
+ * The internal pull-up is only nominally 45k and varies a lot with process and
+ * temperature, so both results carry that error and are worth about a factor of
+ * two. That is plenty: the cases this is built to tell apart differ by orders
+ * of magnitude, not percent.
+ */
+
+/* Datasheet nominal for the internal pull-up. Wide tolerance -- see above. */
+#define RC_R_INTERNAL 45000.0
+
+/*
+ * An RC net reaches the ~0.75*VDD input threshold after ln(4) time constants,
+ * so the measured rise is 1.386*tau.
+ */
+#define RC_THRESHOLD_TAUS 1.386
+
+/* Long enough to fully discharge the net through the output driver: 1ms is
+ * about 25 time constants even for a microfarad behind 40 ohms. */
+#define RC_DISCHARGE_US 1000
+
+/* Give up after this long. It also bounds how long interrupts stay masked.
+ * Reaching it means either the net is held low or it carries tens of nF. */
+#define RC_TIMEOUT_US 5000
+
+static portMUX_TYPE rc_lock = portMUX_INITIALIZER_UNLOCKED;
+
+/*
+ * Bare-register pad access.
+ *
+ * Timing the rise by polling gpio_get_level() in a loop only resolves one loop
+ * iteration, which measured out at ~290ns here -- the same order as the rise
+ * being measured, so every net came back quantised to the same two values.
+ * These reduce the timed path to single register accesses.
+ */
+static inline void pad_write(int pin, int level)
+{
+#ifdef GPIO_OUT1_W1TS_REG
+    if (pin >= 32) {
+        REG_WRITE(level ? GPIO_OUT1_W1TS_REG : GPIO_OUT1_W1TC_REG, BIT(pin - 32));
+        return;
+    }
+#endif
+    REG_WRITE(level ? GPIO_OUT_W1TS_REG : GPIO_OUT_W1TC_REG, BIT(pin));
+}
+
+static inline int pad_level(int pin)
+{
+#ifdef GPIO_IN1_REG
+    if (pin >= 32) {
+        return (REG_READ(GPIO_IN1_REG) >> (pin - 32)) & 1;
+    }
+#endif
+    return (REG_READ(GPIO_IN_REG) >> pin) & 1;
+}
+
+/*
+ * Discharge the net, release the pin, and sample it once exactly `delay` CPU
+ * cycles later. One sample per call: sampling at a chosen instant costs no
+ * time inside the measurement, where a polling loop costs an iteration.
+ *
+ * In open-drain mode writing 1 releases the pad to the pull-ups. In push-pull
+ * it drives high instead, which rises in well under a nanosecond and so
+ * measures the fixed cost of the path from the release to the sample.
+ */
+static int sample_at(int pin, uint32_t delay)
+{
+    pad_write(pin, 0);
+    esp_rom_delay_us(RC_DISCHARGE_US);
+
+    portENTER_CRITICAL(&rc_lock);
+    const uint32_t t0 = esp_cpu_get_cycle_count();
+    pad_write(pin, 1);
+    while (esp_cpu_get_cycle_count() - t0 < delay) {
+        /* spin */
+    }
+    const int level = pad_level(pin);
+    portEXIT_CRITICAL(&rc_lock);
+    return level;
+}
+
+/*
+ * Smallest delay, in CPU cycles, at which the pin reads high after release,
+ * or UINT32_MAX if it never does. Binary search: the rise is monotonic, so
+ * ~20 samples pin it down regardless of the range.
+ */
+static uint32_t find_crossing(int pin, uint32_t limit)
+{
+    if (!sample_at(pin, limit)) {
+        return UINT32_MAX;
+    }
+    if (sample_at(pin, 0)) {
+        return 0;
+    }
+
+    uint32_t lo = 0, hi = limit;
+    while (hi - lo > 1) {
+        const uint32_t mid = lo + (hi - lo) / 2;
+        if (sample_at(pin, mid)) {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    return hi;
+}
+
+/*
+ * Rise time of `pin` in CPU cycles with the given internal pull, or
+ * UINT32_MAX if it never gets high. `overhead` is subtracted out.
+ */
+static uint32_t measure_rise(int pin, pin_pull_t pull, uint32_t limit, uint32_t overhead)
+{
+    configure_pin_pull(pin, GPIO_MODE_INPUT_OUTPUT_OD, pull);
+    const uint32_t crossing = find_crossing(pin, limit);
+    if (crossing == UINT32_MAX) {
+        return UINT32_MAX;
+    }
+    return crossing > overhead ? crossing - overhead : 0;
+}
+
+/* Fixed cost of the release-to-sample path, measured by driving the pin high
+ * push-pull so that the net itself contributes nothing. */
+static uint32_t measure_overhead(int pin, uint32_t limit)
+{
+    configure_pin_pull(pin, GPIO_MODE_INPUT_OUTPUT, PULL_NONE);
+    const uint32_t crossing = find_crossing(pin, limit);
+    return crossing == UINT32_MAX ? 0 : crossing;
+}
+
+static void print_seconds(double s)
+{
+    if (s < 1e-6) {
+        bp_printf("%7.0f ns", s * 1e9);
+    } else if (s < 1e-3) {
+        bp_printf("%7.2f us", s * 1e6);
+    } else {
+        bp_printf("%7.2f ms", s * 1e3);
+    }
+}
+
+static void print_ohms(double r)
+{
+    if (r >= 1e6) {
+        bp_printf("%6.1f M", r / 1e6);
+    } else {
+        bp_printf("%6.1f k", r / 1e3);
+    }
+}
+
+static void print_farads(double c)
+{
+    if (c < 1e-9) {
+        bp_printf("%7.1f pF", c * 1e12);
+    } else if (c < 1e-6) {
+        bp_printf("%7.2f nF", c * 1e9);
+    } else {
+        bp_printf("%7.2f uF", c * 1e6);
+    }
+}
+
+int cmd_gpio_rc(int argc, char **argv)
+{
+    if (argc < 2) {
+        bp_printf("Usage: rc <pin>\n");
+        return -1;
+    }
+
+    int *pins = NULL;
+    int count = 0;
+    if (parse_pin_list(argv[1], &pins, &count) < 0) {
+        bp_error("Invalid pin specification: %s", argv[1]);
+        return -1;
+    }
+
+    const uint32_t cpu_hz = (uint32_t)esp_clk_cpu_freq();
+    const uint32_t limit_cycles = (uint32_t)((uint64_t)RC_TIMEOUT_US * cpu_hz / 1000000);
+
+    bp_printf("Pull-up strength and net capacitance, from how long each pin\n"
+              "takes to rise after being released from a driven low. Measured\n"
+              "twice, the second time with the internal pull-up (~%.0fk) added,\n"
+              "which gives the reference needed to solve for both values.\n"
+              "Accurate to roughly a factor of two -- the internal pull-up is\n"
+              "not a precision part. Nothing else may be driving these pins.\n\n",
+              RC_R_INTERNAL / 1000.0);
+
+    bp_printf(" pin    external   with int    pull-up      net C\n");
+
+    for (int i = 0; i < count; i++) {
+        const int pin = pins[i];
+        const char *why = NULL;
+        if (!GPIO_IS_VALID_GPIO(pin)) {
+            bp_printf("%4d   does not exist on this chip\n", pin);
+            continue;
+        }
+        if (!pin_is_drivable(pin, &why)) {
+            bp_printf("%4d   skipped: %s\n", pin, why);
+            continue;
+        }
+
+        const uint32_t overhead = measure_overhead(pin, limit_cycles);
+        const uint32_t ext = measure_rise(pin, PULL_NONE, limit_cycles, overhead);
+        const uint32_t par = measure_rise(pin, PULL_UP, limit_cycles, overhead);
+        configure_pin_pull(pin, GPIO_MODE_INPUT, PULL_NONE);
+
+        bp_printf("%4d  ", pin);
+
+        if (par == UINT32_MAX) {
+            /* Not even the internal pull-up gets it there in the time allowed. */
+            bp_printf("        --         --         --         --"
+                      "  held low, or >80nF\n");
+            continue;
+        }
+
+        const double t_par = (double)par / cpu_hz;
+        if (ext == UINT32_MAX) {
+            bp_printf("      none  ");
+            print_seconds(t_par);
+            bp_printf("       none  ");
+            print_farads(t_par / RC_THRESHOLD_TAUS / RC_R_INTERNAL);
+            bp_printf("  no external pull-up\n");
+            continue;
+        }
+
+        const double t_ext = (double)ext / cpu_hz;
+        print_seconds(t_ext);
+        bp_printf("  ");
+        print_seconds(t_par);
+        bp_printf("  ");
+
+        /*
+         * Adding a 45k pull-up to a net that already has one must speed it up.
+         * If it did not, the rise is too fast to time and the external pull-up
+         * is much stronger than the reference -- not weaker.
+         */
+        const double ratio = t_ext / t_par;
+        if (ratio <= 1.05) {
+            bp_printf("    <2.5 k         --  too fast to resolve\n");
+            continue;
+        }
+
+        const double r_ext = RC_R_INTERNAL * (ratio - 1.0);
+        print_ohms(r_ext);
+        bp_printf("  ");
+        print_farads(t_ext / RC_THRESHOLD_TAUS / r_ext);
+        bp_printf("\n");
+    }
+
+    free(pins);
+    return 0;
 }
