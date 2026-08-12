@@ -9,6 +9,7 @@
 #include "i2c.h"
 #include "ina237.h"
 #include "sht4x.h"
+#include "nau7802.h"
 #include "spi.h"
 #include "system.h"
 #include "uart.h"
@@ -92,7 +93,25 @@ static const bp_menu_t sht4x_menu = {
     .command_count = ARRAY_COUNT(sht4x_commands),
 };
 
-static const bp_menu_t *const i2c_submenus[] = {&ina237_menu, &sht4x_menu};
+static const bp_command_t nau7802_commands[] = {
+    {"init", "[ldo <volts>]", "Power up, configure and self-calibrate", cmd_nau7802_init},
+    {"status", "", "Show configuration and calibration state", cmd_nau7802_status},
+    {"gain", "[1..128]", "Show or set the PGA gain", cmd_nau7802_gain},
+    {"rate", "[10|20|40|80|320]", "Show or set the sample rate in SPS", cmd_nau7802_rate},
+    {"read", "[samples]", "Averaged raw ADC counts", cmd_nau7802_read},
+    {"tare", "[samples]", "Capture the zero offset with no load", cmd_nau7802_tare},
+    {"calibrate", "<known mass> [samples]", "Derive the scale from a known mass", cmd_nau7802_calibrate},
+    {"weight", "[samples]", "Report the load in calibrated units", cmd_nau7802_weight},
+};
+
+static const bp_menu_t nau7802_menu = {
+    .name = "nau7802",
+    .help = "Nuvoton NAU7802 24-bit bridge ADC / load cell at 0x2a",
+    .commands = nau7802_commands,
+    .command_count = ARRAY_COUNT(nau7802_commands),
+};
+
+static const bp_menu_t *const i2c_submenus[] = {&ina237_menu, &sht4x_menu, &nau7802_menu};
 
 static const bp_menu_t i2c_menu = {
     .name = "i2c",

@@ -17,6 +17,7 @@ idf_component_register(
         "i2c/i2c.c"
         "i2c/ina237.c"
         "i2c/sht4x.c"
+        "i2c/nau7802.c"
         "spi/spi.c"
         "system/system.c"
         "uart/uart.c"

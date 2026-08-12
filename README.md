@@ -211,6 +211,63 @@ condensation, and for confirming the part responds to a stimulus.
 
 Issues a soft reset.
 
+#### NAU7802
+
+Reached as `i2c nau7802 ...`. Drives a Nuvoton NAU7802 24-bit bridge ADC as a
+load cell front end. The address `0x2a` is fixed in silicon — there are no
+address pins, so only one can be present per bus.
+
+The normal bringup sequence is:
+
+```
+i2c nau7802 init            # power up, self-calibrate
+i2c nau7802 gain 128        # typical for a load cell's few mV of output
+i2c nau7802 tare            # with the scale empty
+i2c nau7802 calibrate 100   # with a known 100-unit mass on it
+i2c nau7802 weight          # thereafter, in those units
+```
+
+##### `init [ldo <volts>]`
+
+Resets the device, powers up the digital then analog sections, waits for the
+power-up ready flag, and runs the internal offset calibration.
+
+By default AVDD is taken from the pin, which is the chip's own default.
+Boards that rely on the internal regulator — many load cell breakouts do —
+need `init ldo 3.0`. This is not the default deliberately: enabling the
+internal regulator on a board that already drives AVDD would put two sources on
+one net.
+
+##### `gain [1..128]` and `rate [10|20|40|80|320]`
+
+Show or set the PGA gain and conversion rate. Both re-run the internal offset
+calibration afterwards, because either change alters the analog path and
+invalidates the existing calibration — without that, readings come back
+swinging across most of the full-scale range.
+
+**320 SPS is not usable on the board this was developed against.** It returns
+values spanning the entire range regardless of calibration, while 10–80 SPS are
+rock steady; the likely cause is that 320 SPS needs an external crystal rather
+than the internal RC oscillator. The command warns when you select it.
+
+##### `read [samples]`, `tare [samples]`, `calibrate <known mass> [samples]`, `weight [samples]`
+
+`read` reports the averaged raw count, the spread across the samples, and the
+percentage of full scale. An absolute voltage is deliberately not reported: it
+would depend on REFP−REFN, which this driver has no way to know.
+
+`tare` captures the zero offset, `calibrate` derives the scale factor from a
+known mass, and `weight` reports the load in whatever unit was used to
+calibrate. `weight` also reports the sample spread converted into those units,
+so every reading carries an indication of its own noise.
+
+Two guards worth knowing about. Any reading pinned at full scale is reported as
+a saturation error rather than a large number — during bringup that usually
+means the bridge is disconnected, unexcited or miswired. And `calibrate`
+refuses when the reading has not moved clear of the noise, since calibrating
+against noise yields an absurd scale factor that silently corrupts every later
+weight.
+
 ### UART
 
 This is an auxiliary UART, always separate from the console port, so
