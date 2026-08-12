@@ -410,6 +410,44 @@ gap between this and `bench` is what FAT costs.
 It is read-only, so it is safe to run anywhere on the card. Blocks are rounded
 down to whole sectors and the range is checked against the card's capacity.
 
+#### `sweep [max_khz] [size_kb] [block_kb]`
+
+Steps the clock up and reports the fastest rate the card still returns *correct*
+data at. Defaults to a ceiling of 80 MHz and 512 KiB read per step.
+
+This exists because an overclocked card usually does not fail — it succeeds and
+hands back corrupt data. A sweep that only checked for errors would report a
+confident, entirely wrong answer. So the sweep first reads the test region at
+20 MHz, a rate every card is rated for, and keeps a CRC32 of it; every faster
+step re-reads the same sectors and compares. A CRC rather than a kept copy
+because it costs four bytes instead of a second buffer, which is what lets the
+verified region be big enough to mean something.
+
+The reference is read **twice** and the two must agree. A card that cannot
+reproduce its own data in spec makes every later comparison meaningless, and
+that is worth saying outright rather than deriving an overclocking limit from
+noise.
+
+It is **read-only**. Nothing is written to the card at a clock that has not been
+verified, because a corrupt write is not recoverable the way a corrupt read is.
+
+Two things the report is careful to distinguish:
+
+- **The card failed** — a data mismatch, a read error, or an init failure. The
+  first such rate is reported.
+- **The host ran out of clock.** The dividers quantize, so several requested
+  rates land on the same actual one; that is normal and those steps are skipped.
+  But when *every* larger request produces an identical clock, the card was
+  never driven any faster and its real limit is still unknown. That is reported
+  as a host limitation, not as a pass.
+
+Steps that pass above the card's CSD-rated speed are marked `(overclocked)`.
+Passing one read sweep is not a stability guarantee — it is out of spec, and the
+margin varies with temperature, supply and wiring.
+
+Afterwards the card is left initialized at the fastest verified rate, so
+`sd bench` and `sd raw` measure it without re-entering anything.
+
 #### `close`
 
 Unmounts, releases the card and frees the bus.
@@ -422,9 +460,38 @@ they do internal housekeeping, and on a board that has to keep up with a sensor
 or a camera that stall is what decides whether the design works. An average
 hides it entirely.
 
-Sanity-check the result against the interface ceiling — 20 MHz gives 2.5 MB/s on
-SPI or 1-bit SD, and 10 MB/s on 4-bit SD. A number above the ceiling means
-something was measured other than the card.
+Sanity-check the result against the interface ceiling — at the 20 MHz default
+that is 2.5 MB/s on SPI or 1-bit SD, and 10 MB/s on 4-bit SD, scaling with the
+clock. A number above the ceiling means something was measured other than the
+card.
+
+Measured on the board this was developed against, a XIAO ESP32-S3 Sense with a
+4 GB SDHC card (`SD04G`, rated 25 MHz), 512 KiB in 16 KiB blocks:
+
+| | SPI @ 20 MHz | SD 1-bit @ 20 MHz | SD 1-bit @ 40 MHz |
+|---|---|---|---|
+| Raw read | 1.45 MiB/s | 2.20 MiB/s | 4.19 MiB/s |
+| FAT read | 1.43 MiB/s | 2.19 MiB/s | 4.08 MiB/s |
+| FAT write | 0.39 MiB/s | 0.39 MiB/s | 1.43 MiB/s |
+| Worst write block | 27.7 ms | 849.5 ms | 33.7 ms |
+
+`sd sweep` found the limits to be 20 MHz over SPI and 40 MHz over SD 1-bit. Both
+are worth understanding, because neither is the card:
+
+- **Over SPI it stops at 20 MHz.** At 24 MHz and above the high-speed switch
+  fails re-reading the CSD and the bus starts reporting command CRC errors. The
+  pins used here (7, 8, 9) are not the ESP32-S3's IOMUX pins for SPI2, so the
+  signals go through the GPIO matrix and the extra input delay is what runs out.
+- **Over SD 1-bit it stops at 40 MHz** — but that is the host clamping, not the
+  card. Every request above 40 MHz produced exactly 40.000 MHz, so the card was
+  never actually driven faster and 40 MHz is not known to be its limit. It was
+  still 15 MHz above its rated 25 MHz and read correctly throughout.
+
+Note the 849.5 ms worst-case write block at 20 MHz, against 33.7 ms for the same
+card at 40 MHz. That is not the clock — it is the card pausing for internal
+housekeeping, landing in one run and not the other, and it is large enough to
+drag the whole 20 MHz write average below the SPI one. It is precisely why the
+worst block is reported.
 
 #### Example: Seeed XIAO ESP32-S3 Sense
 

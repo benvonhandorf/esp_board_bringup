@@ -27,6 +27,7 @@
 #include "driver/gpio.h"
 #include "driver/sdspi_host.h"
 #include "esp_heap_caps.h"
+#include "esp_rom_crc.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "sd_protocol_defs.h"
@@ -57,12 +58,27 @@ typedef enum {
     IFACE_MMC,
 } sd_iface_t;
 
+/*
+ * What was asked for. This deliberately survives teardown(), so the card can be
+ * torn down and reopened at a different clock -- which is what `sd sweep` does
+ * on every step -- without the caller re-entering the pins.
+ */
+static struct {
+    sd_iface_t iface;
+    int pins[6];
+    int pin_count;
+    int width;                          /* 1 or 4, for IFACE_MMC */
+    int freq_khz;
+} cfg;
+
+/*
+ * What the hardware currently has open, which is not the same thing: it is
+ * IFACE_NONE between a teardown and the next open, and it is what decides which
+ * host teardown() has to release.
+ */
+static sd_iface_t open_iface;
 static sdmmc_card_t *card;
 static sdmmc_host_t host;
-static sd_iface_t iface;
-static int iface_width;                 /* 1 or 4, for IFACE_MMC */
-static int iface_pins[6];               /* as given to `sd spi` / `sd mmc` */
-static int iface_pin_count;
 static bool host_inited;
 static bool bus_owned;                  /* we called spi_bus_initialize() */
 static sdspi_dev_handle_t spi_dev = -1;
@@ -86,11 +102,11 @@ static bool require_card(void)
 
 static const char *iface_name(void)
 {
-    switch (iface) {
+    switch (cfg.iface) {
     case IFACE_SPI:
         return "SPI";
     case IFACE_MMC:
-        return iface_width == 4 ? "SD 4-bit" : "SD 1-bit";
+        return cfg.width == 4 ? "SD 4-bit" : "SD 1-bit";
     default:
         return "none";
     }
@@ -114,10 +130,11 @@ static void unmount_fat(void)
 }
 
 /*
- * Release everything, in the reverse of the order it was acquired. Called both
- * by `sd close` and at the top of `sd spi` / `sd mmc`, so those commands can be
- * re-run with different pins the way `spi bus` and `i2c bus` can, and so a
- * failed init never leaves half-configured hardware behind.
+ * Release the hardware, in the reverse of the order it was acquired, leaving
+ * `cfg` alone. Called by `sd close`, at the top of `sd spi` / `sd mmc` so those
+ * can be re-run with different pins the way `spi bus` and `i2c bus` can, on
+ * every step of `sd sweep`, and on every init failure so a failed attempt never
+ * leaves half-configured hardware behind.
  */
 static void teardown(void)
 {
@@ -126,7 +143,7 @@ static void teardown(void)
     free(card);
     card = NULL;
 
-    if (iface == IFACE_SPI) {
+    if (open_iface == IFACE_SPI) {
         if (spi_dev >= 0) {
             sdspi_host_remove_device(spi_dev);
             spi_dev = -1;
@@ -136,7 +153,7 @@ static void teardown(void)
         }
     }
 #if SOC_SDMMC_HOST_SUPPORTED
-    else if (iface == IFACE_MMC) {
+    else if (open_iface == IFACE_MMC) {
         if (host_inited) {
             sdmmc_host_deinit();
         }
@@ -149,9 +166,7 @@ static void teardown(void)
         bus_owned = false;
     }
 
-    iface = IFACE_NONE;
-    iface_width = 0;
-    iface_pin_count = 0;
+    open_iface = IFACE_NONE;
 }
 
 /* ------------------------------------------------------------------ */
@@ -263,9 +278,9 @@ int cmd_sd_info(int argc, char **argv)
         return -1;
     }
 
-    bp_printf("Interface: %s on pin%s", iface_name(), iface_pin_count == 1 ? " " : "s ");
-    for (int i = 0; i < iface_pin_count; i++) {
-        bp_printf("%s%d", i ? "," : "", iface_pins[i]);
+    bp_printf("Interface: %s on pins ", iface_name());
+    for (int i = 0; i < cfg.pin_count; i++) {
+        bp_printf("%s%d", i ? "," : "", cfg.pins[i]);
     }
     bp_printf("\n");
 
@@ -306,9 +321,16 @@ int cmd_sd_info(int argc, char **argv)
     if (card->real_freq_khz == 0) {
         bp_printf("Clock:     unknown\n");
     } else {
-        bp_printf("Clock:     %.3f MHz (card limit %.3f MHz)%s%s\n",
-                  card->real_freq_khz / 1000.0, card->max_freq_khz / 1000.0,
+        bp_printf("Clock:     %.3f MHz requested %d kHz, negotiated ceiling %.3f MHz%s%s\n",
+                  card->real_freq_khz / 1000.0, cfg.freq_khz, card->max_freq_khz / 1000.0,
                   card->is_ddr ? ", DDR" : "", card->is_uhs1 ? ", UHS-I" : "");
+        /*
+         * The CSD speed is what the card advertises after any high-speed switch,
+         * and is therefore the line between running it in spec and overclocking
+         * it. `sd sweep` finds out what it will actually tolerate.
+         */
+        bp_printf("Card rated: %.3f MHz per CSD%s\n", card->csd.tr_speed / 1e6,
+                  card->real_freq_khz * 1000 > card->csd.tr_speed ? "  <-- OVERCLOCKED" : "");
     }
 
     bp_printf("Bus width: %d bit negotiated\n", 1 << card->log_bus_width);
@@ -339,25 +361,170 @@ int cmd_sd_info(int argc, char **argv)
 /* Bring-up                                                            */
 /* ------------------------------------------------------------------ */
 
-/* Common tail of `sd spi` and `sd mmc`: probe the card and report. */
-static int finish_init(const char *what)
+static esp_err_t open_spi(void)
 {
+    const spi_bus_config_t bus_config = {
+        .sclk_io_num = cfg.pins[0],
+        .mosi_io_num = cfg.pins[1],
+        .miso_io_num = cfg.pins[2],
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = MAX_BLOCK_KB * 1024,
+    };
+
+    esp_err_t err = spi_bus_initialize(BP_SPI_HOST_ID, &bus_config, SPI_DMA_CH_AUTO);
+    if (err != ESP_OK) {
+        return err;
+    }
+    bus_owned = true;
+
+    err = sdspi_host_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+    host_inited = true;
+
+    sdspi_device_config_t dev_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    dev_config.host_id = BP_SPI_HOST_ID;
+    dev_config.gpio_cs = cfg.pins[3];
+
+    err = sdspi_host_init_device(&dev_config, &spi_dev);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    host = (sdmmc_host_t)SDSPI_HOST_DEFAULT();
+    host.slot = spi_dev;
+    host.max_freq_khz = cfg.freq_khz;
+    return ESP_OK;
+}
+
+#if SOC_SDMMC_HOST_SUPPORTED
+static esp_err_t open_mmc(void)
+{
+    host = (sdmmc_host_t)SDMMC_HOST_DEFAULT();
+    host.max_freq_khz = cfg.freq_khz;
+    host.slot = SDMMC_HOST_SLOT_1;
+
+    /*
+     * The bus width is driven by the slot, not by host.flags: sdmmc_fix_host_flags()
+     * reads the slot width back and narrows the host flags to match, so setting
+     * .width alone is what actually keeps a 1-bit slot from being switched to
+     * 4-bit during initialization.
+     */
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot_config.clk = cfg.pins[0];
+    slot_config.cmd = cfg.pins[1];
+    slot_config.d0 = cfg.pins[2];
+    if (cfg.width == 4) {
+        slot_config.d1 = cfg.pins[3];
+        slot_config.d2 = cfg.pins[4];
+        slot_config.d3 = cfg.pins[5];
+    }
+    slot_config.cd = SDMMC_SLOT_NO_CD;
+    slot_config.wp = SDMMC_SLOT_NO_WP;
+    slot_config.width = (uint8_t)cfg.width;
+    /* Boards being brought up frequently lack the external pull-ups the bus
+     * needs; the internal ones are weak but usually enough to get a card to
+     * answer, which is the point of the exercise. */
+    slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+
+    esp_err_t err = sdmmc_host_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+    host_inited = true;
+
+    return sdmmc_host_init_slot(host.slot, &slot_config);
+}
+#endif
+
+/*
+ * Bring the hardware up from `cfg` and probe the card. Quiet on success: the
+ * sweep calls this once per clock step and does its own reporting.
+ *
+ * Always leaves the hardware released on failure, so the caller can go straight
+ * on to the next attempt.
+ */
+static esp_err_t open_card(void)
+{
+    teardown();
+
+    esp_err_t err;
+    if (cfg.iface == IFACE_SPI) {
+        open_iface = IFACE_SPI;
+        err = open_spi();
+    }
+#if SOC_SDMMC_HOST_SUPPORTED
+    else if (cfg.iface == IFACE_MMC) {
+        open_iface = IFACE_MMC;
+        err = open_mmc();
+    }
+#endif
+    else {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (err != ESP_OK) {
+        teardown();
+        return err;
+    }
+
     card = calloc(1, sizeof(sdmmc_card_t));
     if (!card) {
-        bp_error("Out of memory");
         teardown();
-        return -1;
+        return ESP_ERR_NO_MEM;
     }
 
-    esp_err_t err = sdmmc_card_init(&host, card);
+    err = sdmmc_card_init(&host, card);
     if (err != ESP_OK) {
-        bp_error("Initializing the card over %s: %s", what, esp_err_to_name(err));
         teardown();
-        return -1;
+        return err;
     }
+    return ESP_OK;
+}
 
-    bp_printf("Card up over %s at %.3f MHz\n", iface_name(), card->real_freq_khz / 1000.0);
-    return cmd_sd_info(0, NULL);
+/*
+ * A card that answers CMD0 and CMD8 but then times out on ACMD41 has been asked
+ * to power up and never finished. In practice on a bring-up bench that is
+ * almost never the driver: the card has latched into SPI mode, or a connector is
+ * marginal. Both cost minutes to find and seconds to fix, so say so rather than
+ * leaving a bare ESP_ERR_TIMEOUT.
+ */
+static void explain_init_timeout(esp_err_t err)
+{
+    if (err != ESP_ERR_TIMEOUT) {
+        return;
+    }
+    bp_printf("      The card did not complete power-up (ACMD41). Usually one of:\n");
+    bp_printf("      - It is latched in SPI mode from an earlier 'sd spi'. A card\n");
+    bp_printf("        leaves SPI mode only when its power is removed, and a board\n");
+    bp_printf("        reset does not do that -- unplug and replug the board.\n");
+    bp_printf("      - The card or an expansion connector is not fully seated.\n");
+    bp_printf("      - The card is failing. Try another one.\n");
+}
+
+/*
+ * ESP-IDF maps these three exact frequencies onto the UHS-I modes and rejects
+ * them outright on a host without UHS support. Asking for 50000 kHz on an
+ * ESP32-S3 therefore fails with a bare ESP_ERR_NOT_SUPPORTED that says nothing
+ * about why, so say it here instead.
+ */
+static bool frequency_is_reserved(int freq_khz)
+{
+#if SOC_SDMMC_UHS_I_SUPPORTED
+    (void)freq_khz;
+    return false;
+#else
+    if (freq_khz == SDMMC_FREQ_DDR50 || freq_khz == SDMMC_FREQ_SDR50 ||
+        freq_khz == SDMMC_FREQ_SDR104) {
+        bp_error("%d kHz selects a UHS-I mode, which %s does not support. Ask for "
+                 "a nearby rate such as %d kHz instead.",
+                 freq_khz, CONFIG_IDF_TARGET, freq_khz - 1000);
+        return true;
+    }
+    return false;
+#endif
 }
 
 int cmd_sd_spi(int argc, char **argv)
@@ -383,6 +550,9 @@ int cmd_sd_spi(int argc, char **argv)
     if (!check_pins(pins, 4, names)) {
         return -1;
     }
+    if (frequency_is_reserved(freq_khz)) {
+        return -1;
+    }
 
     if (spi_menu_owns_host()) {
         bp_error("The 'spi' menu holds the SPI host. Release it with 'spi free' first.");
@@ -390,53 +560,22 @@ int cmd_sd_spi(int argc, char **argv)
     }
 
     teardown();
-    iface = IFACE_SPI;
+    cfg.iface = IFACE_SPI;
+    memcpy(cfg.pins, pins, sizeof(pins));
+    cfg.pin_count = 4;
+    cfg.width = 1;
+    cfg.freq_khz = freq_khz;
 
-    const spi_bus_config_t bus_config = {
-        .sclk_io_num = pins[0],
-        .mosi_io_num = pins[1],
-        .miso_io_num = pins[2],
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = MAX_BLOCK_KB * 1024,
-    };
-
-    esp_err_t err = spi_bus_initialize(BP_SPI_HOST_ID, &bus_config, SPI_DMA_CH_AUTO);
+    esp_err_t err = open_card();
     if (err != ESP_OK) {
-        bp_error("Initializing the SPI bus: %s", esp_err_to_name(err));
-        teardown();
-        return -1;
-    }
-    bus_owned = true;
-
-    err = sdspi_host_init();
-    if (err != ESP_OK) {
-        bp_error("Initializing the SD-over-SPI host: %s", esp_err_to_name(err));
-        teardown();
-        return -1;
-    }
-    host_inited = true;
-
-    sdspi_device_config_t dev_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    dev_config.host_id = BP_SPI_HOST_ID;
-    dev_config.gpio_cs = pins[3];
-
-    err = sdspi_host_init_device(&dev_config, &spi_dev);
-    if (err != ESP_OK) {
-        bp_error("Attaching the card to the SPI bus: %s", esp_err_to_name(err));
-        teardown();
+        bp_error("Initializing the card over SPI at %d kHz: %s", freq_khz,
+                 esp_err_to_name(err));
+        explain_init_timeout(err);
         return -1;
     }
 
-    host = (sdmmc_host_t)SDSPI_HOST_DEFAULT();
-    host.slot = spi_dev;
-    host.max_freq_khz = freq_khz;
-
-    memcpy(iface_pins, pins, sizeof(pins));
-    iface_pin_count = 4;
-    iface_width = 1;
-
-    return finish_init("SPI");
+    bp_printf("Card up over SPI at %.3f MHz\n", card->real_freq_khz / 1000.0);
+    return cmd_sd_info(0, NULL);
 }
 
 #if SOC_SDMMC_HOST_SUPPORTED
@@ -449,8 +588,7 @@ int cmd_sd_mmc(int argc, char **argv)
     int index = 1;
     while (index < argc && pin_count < 6 && strcasecmp(argv[index], "khz") != 0) {
         if (parse_int_arg(argv[index], &pins[pin_count]) < 0) {
-            bp_error("%s must be a pin number, not '%s'",
-                     pin_count < 6 ? names[pin_count] : "pin", argv[index]);
+            bp_error("%s must be a pin number, not '%s'", names[pin_count], argv[index]);
             return -1;
         }
         pin_count++;
@@ -470,59 +608,27 @@ int cmd_sd_mmc(int argc, char **argv)
     if (!check_pins(pins, pin_count, names)) {
         return -1;
     }
-
-    const int width = (pin_count == 6) ? 4 : 1;
+    if (frequency_is_reserved(freq_khz)) {
+        return -1;
+    }
 
     teardown();
-    iface = IFACE_MMC;
-    iface_width = width;
+    cfg.iface = IFACE_MMC;
+    memcpy(cfg.pins, pins, sizeof(int) * (size_t)pin_count);
+    cfg.pin_count = pin_count;
+    cfg.width = (pin_count == 6) ? 4 : 1;
+    cfg.freq_khz = freq_khz;
 
-    host = (sdmmc_host_t)SDMMC_HOST_DEFAULT();
-    host.max_freq_khz = freq_khz;
-    host.slot = SDMMC_HOST_SLOT_1;
-
-    /*
-     * The bus width is driven by the slot, not by host.flags: sdmmc_fix_host_flags()
-     * reads the slot width back and narrows the host flags to match, so setting
-     * .width alone is what actually keeps a 1-bit slot from being switched to
-     * 4-bit during initialization.
-     */
-    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot_config.clk = pins[0];
-    slot_config.cmd = pins[1];
-    slot_config.d0 = pins[2];
-    if (width == 4) {
-        slot_config.d1 = pins[3];
-        slot_config.d2 = pins[4];
-        slot_config.d3 = pins[5];
-    }
-    slot_config.cd = SDMMC_SLOT_NO_CD;
-    slot_config.wp = SDMMC_SLOT_NO_WP;
-    slot_config.width = (uint8_t)width;
-    /* Boards being brought up frequently lack the external pull-ups the bus
-     * needs; the internal ones are weak but usually enough to get a card to
-     * answer, which is the point of the exercise. */
-    slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-
-    esp_err_t err = sdmmc_host_init();
+    esp_err_t err = open_card();
     if (err != ESP_OK) {
-        bp_error("Initializing the SD host: %s", esp_err_to_name(err));
-        teardown();
-        return -1;
-    }
-    host_inited = true;
-
-    err = sdmmc_host_init_slot(host.slot, &slot_config);
-    if (err != ESP_OK) {
-        bp_error("Configuring the SD slot: %s", esp_err_to_name(err));
-        teardown();
+        bp_error("Initializing the card over %s at %d kHz: %s", iface_name(), freq_khz,
+                 esp_err_to_name(err));
+        explain_init_timeout(err);
         return -1;
     }
 
-    memcpy(iface_pins, pins, sizeof(int) * (size_t)pin_count);
-    iface_pin_count = pin_count;
-
-    return finish_init(width == 4 ? "SD 4-bit" : "SD 1-bit");
+    bp_printf("Card up over %s at %.3f MHz\n", iface_name(), card->real_freq_khz / 1000.0);
+    return cmd_sd_info(0, NULL);
 }
 #else  /* !SOC_SDMMC_HOST_SUPPORTED */
 int cmd_sd_mmc(int argc, char **argv)
@@ -540,11 +646,13 @@ int cmd_sd_close(int argc, char **argv)
     (void)argc;
     (void)argv;
 
-    if (iface == IFACE_NONE) {
+    if (cfg.iface == IFACE_NONE) {
         bp_printf("No SD card is initialized.\n");
         return 0;
     }
     teardown();
+    cfg.iface = IFACE_NONE;
+    cfg.pin_count = 0;
     bp_printf("SD released.\n");
     return 0;
 }
@@ -857,4 +965,315 @@ int cmd_sd_raw(int argc, char **argv)
     report("Read", &result, block_bytes);
     free(buffer);
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Clock sweep                                                         */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Rates to try, in kHz. The host divides a fixed source clock, so most of these
+ * land on the same actual frequency as a neighbour; the sweep reports what was
+ * really produced and skips a step that repeats the previous one.
+ *
+ * 50000, 100000 and 200000 are deliberately absent: ESP-IDF treats those exact
+ * values as requests for UHS-I modes and rejects them on hosts without UHS
+ * support, which would look like a card failure rather than a host limitation.
+ */
+static const int freq_ladder[] = {
+    20000, 24000, 26667, 30000, 33333, 36000, 40000,
+    44000, 48000, 52000, 56000, 60000, 66667, 72000, 80000,
+};
+
+#define SWEEP_BASELINE_KHZ SDMMC_FREQ_DEFAULT
+#define SWEEP_MAX_CONSECUTIVE_FAILURES 3
+
+/*
+ * How many consecutive steps may produce the same clock as the one before
+ * before the sweep concludes the host, not the card, is the limit.
+ *
+ * It cannot be 1: the divider legitimately skips a step here and there (asking
+ * for 30 MHz when 26.67 and 32 are the neighbouring divisors lands back on
+ * 26.67, and the next step up still moves). Three in a row does not happen for
+ * that reason -- it means every larger request is being clamped.
+ */
+#define SWEEP_MAX_CONSECUTIVE_DUPLICATES 3
+
+/*
+ * Read `blocks` blocks from sector 0 and return a CRC32 over the lot.
+ *
+ * A CRC rather than a kept copy of the reference: it costs 4 bytes instead of a
+ * second buffer, which is what lets the verified region be large enough to be
+ * worth something on a chip with a few hundred KB of RAM.
+ */
+static esp_err_t read_crc(uint8_t *buffer, size_t block_bytes, uint32_t blocks,
+                          size_t sectors_per_block, uint32_t *out_crc,
+                          bench_result_t *out_timing)
+{
+    uint32_t crc = 0;
+    bench_result_t timing = {0};
+
+    for (uint32_t i = 0; i < blocks; i++) {
+        size_t sector = (size_t)i * sectors_per_block;
+
+        int64_t start = esp_timer_get_time();
+        esp_err_t err = sdmmc_read_sectors(card, buffer, sector, sectors_per_block);
+        int64_t elapsed = esp_timer_get_time() - start;
+        if (err != ESP_OK) {
+            return err;
+        }
+
+        timing.bytes += block_bytes;
+        timing.elapsed_us += elapsed;
+        if (elapsed > timing.worst_block_us) {
+            timing.worst_block_us = elapsed;
+        }
+        crc = esp_rom_crc32_le(crc, buffer, (uint32_t)block_bytes);
+    }
+
+    *out_crc = crc;
+    if (out_timing) {
+        *out_timing = timing;
+    }
+    return ESP_OK;
+}
+
+static double throughput_kib_s(const bench_result_t *r)
+{
+    if (r->elapsed_us <= 0) {
+        return 0.0;
+    }
+    return ((double)r->bytes / 1024.0) / ((double)r->elapsed_us / 1e6);
+}
+
+int cmd_sd_sweep(int argc, char **argv)
+{
+    if (!require_card()) {
+        return -1;
+    }
+
+    int max_khz = MAX_FREQ_KHZ;
+    if (argc > 1 && (parse_int_arg(argv[1], &max_khz) < 0 ||
+                     max_khz < SWEEP_BASELINE_KHZ || max_khz > MAX_FREQ_KHZ)) {
+        bp_error("Ceiling must be %d-%d kHz", SWEEP_BASELINE_KHZ, MAX_FREQ_KHZ);
+        return -1;
+    }
+
+    size_t total_bytes = 0, block_bytes = 0;
+    if (take_sizes(argc, argv, 2, &total_bytes, &block_bytes) < 0) {
+        return -1;
+    }
+
+    const size_t sector_size = (size_t)card->csd.sector_size;
+    if (sector_size == 0 || block_bytes < sector_size) {
+        bp_error("Block size must be at least the %u byte sector size", (unsigned)sector_size);
+        return -1;
+    }
+    const size_t sectors_per_block = block_bytes / sector_size;
+    block_bytes = sectors_per_block * sector_size;
+    const uint32_t blocks = (uint32_t)(total_bytes / block_bytes);
+    if (blocks == 0 || (uint64_t)blocks * sectors_per_block > (uint64_t)card->csd.capacity) {
+        bp_error("Test region does not fit on the card");
+        return -1;
+    }
+
+    /* Remember what to fall back to if every overclocked rate fails. */
+    const int entry_freq_khz = cfg.freq_khz;
+
+    uint8_t *buffer = heap_caps_malloc(block_bytes, MALLOC_CAP_DMA);
+    if (!buffer) {
+        bp_error("Out of DMA-capable memory for a %u KiB block",
+                 (unsigned)(block_bytes / 1024));
+        return -1;
+    }
+
+    bp_printf("Clock sweep over %s, %u KiB read per step from sector 0.\n",
+              iface_name(), (unsigned)(blocks * block_bytes / 1024));
+    bp_printf("Read-only: nothing is written to the card at an unverified clock.\n");
+
+    /*
+     * The drivers log the same lines on every single init, and the sweep does
+     * one init per step; left alone that is a dozen copies of each interleaved
+     * with the results table. Only the informational chatter is silenced --
+     * warnings and errors still come through, because the reason a step failed
+     * is exactly what the table cannot say on its own. Restored before
+     * returning.
+     */
+    esp_log_level_set("SD_HOST", ESP_LOG_ERROR);
+    esp_log_level_set("sdspi_transaction", ESP_LOG_WARN);
+
+    int result = -1;
+    uint32_t reference_crc = 0;
+
+    /*
+     * Establish the reference at a rate the card is rated for. Read it twice: if
+     * the card cannot reproduce its own data in spec then every comparison after
+     * this is meaningless, and it is better to say so than to report a
+     * confident-looking overclocking limit derived from noise.
+     */
+    cfg.freq_khz = SWEEP_BASELINE_KHZ;
+    esp_err_t err = open_card();
+    if (err != ESP_OK) {
+        bp_error("Re-initializing at the %d kHz reference rate: %s",
+                 SWEEP_BASELINE_KHZ, esp_err_to_name(err));
+        goto done;
+    }
+
+    bench_result_t reference_timing = {0};
+    err = read_crc(buffer, block_bytes, blocks, sectors_per_block, &reference_crc,
+                   &reference_timing);
+    if (err == ESP_OK) {
+        uint32_t again = 0;
+        err = read_crc(buffer, block_bytes, blocks, sectors_per_block, &again, NULL);
+        if (err == ESP_OK && again != reference_crc) {
+            bp_error("The card returned different data for the same sectors at the "
+                     "in-spec %d kHz reference rate. It is not reliable enough to "
+                     "sweep; nothing above this can be trusted either.",
+                     SWEEP_BASELINE_KHZ);
+            goto done;
+        }
+    }
+    if (err != ESP_OK) {
+        bp_error("Reading the reference at %d kHz: %s", SWEEP_BASELINE_KHZ,
+                 esp_err_to_name(err));
+        goto done;
+    }
+
+    const int rated_khz = card->csd.tr_speed / 1000;
+    bp_printf("Reference CRC 0x%08X, stable over two passes. Card is rated for "
+              "%.3f MHz.\n\n", (unsigned)reference_crc, rated_khz / 1000.0);
+    bp_printf("  Requested     Actual   Read speed   Result\n");
+
+    int best_requested_khz = 0;
+    int best_actual_khz = 0;
+    double best_kib_s = 0.0;
+    int previous_actual_khz = -1;
+    int consecutive_failures = 0;
+    int consecutive_duplicates = 0;
+    int first_failure_khz = 0;
+    bool host_clamped = false;
+
+    for (size_t i = 0; i < sizeof(freq_ladder) / sizeof(freq_ladder[0]); i++) {
+        const int requested = freq_ladder[i];
+        if (requested > max_khz) {
+            break;
+        }
+
+        cfg.freq_khz = requested;
+        err = open_card();
+        if (err != ESP_OK) {
+            bp_printf("  %7d kHz          -            -   init failed: %s\n",
+                      requested, esp_err_to_name(err));
+            if (!first_failure_khz) {
+                first_failure_khz = requested;
+            }
+            if (++consecutive_failures >= SWEEP_MAX_CONSECUTIVE_FAILURES) {
+                bp_printf("  ... stopping after %d consecutive failures.\n",
+                          consecutive_failures);
+                break;
+            }
+            continue;
+        }
+
+        const int actual = card->real_freq_khz;
+        if (actual == previous_actual_khz) {
+            bp_printf("  %7d kHz  %7.3f MHz            -   same clock as the previous "
+                      "step, skipped\n", requested, actual / 1000.0);
+            if (++consecutive_duplicates >= SWEEP_MAX_CONSECUTIVE_DUPLICATES) {
+                host_clamped = true;
+                break;
+            }
+            continue;
+        }
+        previous_actual_khz = actual;
+        consecutive_duplicates = 0;
+
+        uint32_t crc = 0;
+        bench_result_t timing = {0};
+        err = read_crc(buffer, block_bytes, blocks, sectors_per_block, &crc, &timing);
+
+        if (err != ESP_OK) {
+            bp_printf("  %7d kHz  %7.3f MHz            -   read failed: %s\n",
+                      requested, actual / 1000.0, esp_err_to_name(err));
+        } else if (crc != reference_crc) {
+            /* This is the failure mode that matters: the transfer "succeeded"
+             * and returned corrupt data. Without the CRC it would have been
+             * recorded as a pass with a very good throughput figure. */
+            bp_printf("  %7d kHz  %7.3f MHz   %8.1f KiB/s   DATA MISMATCH (CRC 0x%08X)\n",
+                      requested, actual / 1000.0, throughput_kib_s(&timing), (unsigned)crc);
+        } else {
+            const double kib_s = throughput_kib_s(&timing);
+            bp_printf("  %7d kHz  %7.3f MHz   %8.1f KiB/s   ok%s\n",
+                      requested, actual / 1000.0, kib_s,
+                      actual > rated_khz ? "  (overclocked)" : "");
+            if (actual > best_actual_khz) {
+                best_requested_khz = requested;
+                best_actual_khz = actual;
+                best_kib_s = kib_s;
+            }
+            consecutive_failures = 0;
+            continue;
+        }
+
+        if (!first_failure_khz) {
+            first_failure_khz = requested;
+        }
+        if (++consecutive_failures >= SWEEP_MAX_CONSECUTIVE_FAILURES) {
+            bp_printf("  ... stopping after %d consecutive failures.\n", consecutive_failures);
+            break;
+        }
+    }
+
+    bp_printf("\n");
+    if (best_actual_khz == 0) {
+        bp_error("No rate passed, not even the %d kHz reference.", SWEEP_BASELINE_KHZ);
+        cfg.freq_khz = entry_freq_khz;
+    } else {
+        bp_printf("Fastest verified: %.3f MHz at %.1f KiB/s (%.2f MiB/s), %.2fx the "
+                  "reference.\n", best_actual_khz / 1000.0, best_kib_s,
+                  best_kib_s / 1024.0,
+                  throughput_kib_s(&reference_timing) > 0.0
+                      ? best_kib_s / throughput_kib_s(&reference_timing) : 0.0);
+        if (first_failure_khz) {
+            bp_printf("First failure:    %d kHz requested.\n", first_failure_khz);
+        } else if (host_clamped) {
+            /*
+             * Not the same thing as "the card is happy up here". Every larger
+             * request produced the identical clock, so the card was never
+             * actually driven any faster and its own limit is still unknown.
+             */
+            bp_printf("Limited by the host, not the card: every request above %d kHz "
+                      "produced the same %.3f MHz, so the card was never clocked any "
+                      "faster than that. %s cannot drive it harder on this interface.\n",
+                      best_requested_khz, best_actual_khz / 1000.0, CONFIG_IDF_TARGET);
+        } else {
+            bp_printf("No failures up to the %d kHz ceiling that was asked for; raise "
+                      "it to look further.\n", max_khz);
+        }
+        if (best_actual_khz > rated_khz) {
+            bp_printf("This is %.3f MHz above the card's rated %.3f MHz. Passing one "
+                      "read sweep is not a stability guarantee: overclocking is out of "
+                      "spec, and margin varies with temperature, supply and wiring.\n",
+                      (best_actual_khz - rated_khz) / 1000.0, rated_khz / 1000.0);
+        }
+        cfg.freq_khz = best_requested_khz;
+        result = 0;
+    }
+
+    /* Leave the card usable at the best rate found, rather than wherever the
+     * sweep happened to stop. */
+    err = open_card();
+    if (err != ESP_OK) {
+        bp_error("Re-initializing at %d kHz after the sweep: %s", cfg.freq_khz,
+                 esp_err_to_name(err));
+        result = -1;
+    } else {
+        bp_printf("Card re-initialized at %.3f MHz.\n", card->real_freq_khz / 1000.0);
+    }
+
+done:
+    esp_log_level_set("SD_HOST", ESP_LOG_WARN);
+    esp_log_level_set("sdspi_transaction", ESP_LOG_INFO);
+    free(buffer);
+    return result;
 }

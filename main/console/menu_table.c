@@ -156,6 +156,7 @@ static const bp_command_t sd_commands[] = {
     {"info", "", "Report the detected card", cmd_sd_info},
     {"bench", "[size_kb] [block_kb]", "Measure write and read speed through FAT", cmd_sd_bench},
     {"raw", "[size_kb] [block_kb] [start_sector]", "Measure read speed with no filesystem", cmd_sd_raw},
+    {"sweep", "[max_khz] [size_kb] [block_kb]", "Find the fastest clock the card reads correctly at", cmd_sd_sweep},
     {"close", "", "Unmount, release the card and free the bus", cmd_sd_close},
 };
 
