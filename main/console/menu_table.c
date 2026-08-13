@@ -4,6 +4,10 @@
  */
 #include "menu.h"
 
+#include "audio.h"
+#include "board.h"
+#include "codec_nau8822.h"
+#include "codec_ns4168.h"
 #include "gpio.h"
 #include "pwm.h"
 #include "i2c.h"
@@ -170,16 +174,110 @@ static const bp_menu_t sd_menu = {
     .command_count = ARRAY_COUNT(sd_commands),
 };
 
+static const bp_command_t nau8822_commands[] = {
+    {"init", "[address]", "Power up and configure the codec (0x1a default)", cmd_nau8822_init},
+    {"status", "", "Show identity, routing and volume", cmd_nau8822_status},
+    {"reg", "<n> [value]", "Read or write a 9-bit register", cmd_nau8822_reg},
+    {"route", "<hp|speaker|both>", "Choose which outputs are driven", cmd_nau8822_route},
+};
+
+static const bp_menu_t nau8822_menu = {
+    .name = "nau8822",
+    .help = "Nuvoton NAU8822 stereo codec with speaker driver, I2C at 0x1a/0x1b",
+    .commands = nau8822_commands,
+    .command_count = ARRAY_COUNT(nau8822_commands),
+};
+
+static const bp_command_t ns4168_commands[] = {
+    {"init", "[sd <pin>]", "Attach the amplifier and enable it", cmd_ns4168_init},
+    {"status", "", "Show the enable pin and its state", cmd_ns4168_status},
+};
+
+static const bp_menu_t ns4168_menu = {
+    .name = "ns4168",
+    .help = "NS4168 mono I2S class-D amplifier (no control bus)",
+    .commands = ns4168_commands,
+    .command_count = ARRAY_COUNT(ns4168_commands),
+};
+
+static const bp_command_t audio_commands[] = {
+    {"bus", "<bclk> <ws> <dout> [din <pin>] [mclk <pin>] [rate <hz>] [bits <n>]",
+     "Initialize I2S and start its clocks", cmd_audio_bus},
+    {"info", "", "Show pins, format, clocks and the attached codec", cmd_audio_info},
+    {"codecs", "", "List the parts this firmware can drive", cmd_audio_codecs},
+    {"tone", "<hz> [seconds|continuous] [level <pct>] [left|right|both]",
+     "Play a sine tone", cmd_audio_tone},
+    {"sweep", "<start_hz> <end_hz> [seconds] [level <pct>] [log|linear]",
+     "Sweep a sine tone between two frequencies", cmd_audio_sweep},
+    {"stop", "", "End a continuous tone", cmd_audio_stop},
+    {"volume", "[pct]", "Show or set the codec's output volume", cmd_audio_volume},
+    {"mute", "[on|off]", "Mute or unmute the codec", cmd_audio_mute},
+    {"close", "", "Detach the codec and release I2S", cmd_audio_close},
+};
+
+static const bp_menu_t *const audio_submenus[] = {&nau8822_menu, &ns4168_menu};
+
+static const bp_menu_t audio_menu = {
+    .name = "audio",
+    .help = "Audio output over I2S: tone and sweep testing through a codec or amplifier",
+    .commands = audio_commands,
+    .command_count = ARRAY_COUNT(audio_commands),
+    .submenus = audio_submenus,
+    .submenu_count = ARRAY_COUNT(audio_submenus),
+};
+
+static const bp_command_t cardputer_commands[] = {
+    {"pins", "", "Show the known pinout", cmd_board_cardputer_pins},
+    {"audio", "", "Set up I2S and the NS4168 speaker amplifier", cmd_board_cardputer_audio},
+    {"sd", "", "Bring the microSD slot up over SPI", cmd_board_cardputer_sd},
+};
+
+static const bp_menu_t cardputer_menu = {
+    .name = "cardputer",
+    .help = "M5Stack Cardputer (esp32s3)",
+    .commands = cardputer_commands,
+    .command_count = ARRAY_COUNT(cardputer_commands),
+};
+
+static const bp_command_t xiao_commands[] = {
+    {"pins", "", "Show the known pinout", cmd_board_xiao_pins},
+    {"sd", "", "Bring the microSD slot up over SPI", cmd_board_xiao_sd},
+};
+
+static const bp_menu_t xiao_menu = {
+    .name = "xiao",
+    .help = "Seeed XIAO ESP32-S3 Sense (esp32s3)",
+    .commands = xiao_commands,
+    .command_count = ARRAY_COUNT(xiao_commands),
+};
+
+static const bp_command_t board_commands[] = {
+    {"list", "", "List the boards this firmware knows", cmd_board_list},
+};
+
+static const bp_menu_t *const board_submenus[] = {&cardputer_menu, &xiao_menu};
+
+static const bp_menu_t board_menu = {
+    .name = "board",
+    .help = "Known board pinouts and per-subsystem setup presets",
+    .commands = board_commands,
+    .command_count = ARRAY_COUNT(board_commands),
+    .submenus = board_submenus,
+    .submenu_count = ARRAY_COUNT(board_submenus),
+};
+
 static const bp_command_t wifi_commands[] = {
     {"scan", "", "List nearby access points", cmd_wifi_scan},
     {"connect", "<AP> [password]", "Join an access point", cmd_wifi_connect},
+    {"ap", "<SSID> [password] [channel]", "Host an access point (or 'ap stop')", cmd_wifi_ap},
+    {"autostart", "", "Join the stored network, or host an access point", cmd_wifi_autostart},
     {"status", "", "Show the current association and IP", cmd_wifi_status},
     {"iperf", "<server>[:<port>] [continuous]", "Measure throughput (iperf2 TCP)", cmd_wifi_iperf},
 };
 
 static const bp_menu_t wifi_menu = {
     .name = "wifi",
-    .help = "Station-mode WiFi and throughput testing",
+    .help = "WiFi as a station or an access point, and throughput testing",
     .commands = wifi_commands,
     .command_count = ARRAY_COUNT(wifi_commands),
 };
@@ -192,6 +290,8 @@ static const bp_menu_t *const root_submenus[] = {
     &uart_menu,
     &spi_menu,
     &sd_menu,
+    &audio_menu,
+    &board_menu,
 };
 
 const bp_menu_t bp_root_menu = {

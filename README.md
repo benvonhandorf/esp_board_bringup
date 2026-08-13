@@ -2,7 +2,9 @@
 
 This project is a CLI driven way to test any ESP series microcontroller board.  It uses the ESP command processing system to allow you to exercise different parts of the system directly, before a proper BSP is written.
 
-The menu system and all outputs are visible on the primary serial port and a web interface hosted on the device, if it is connected to a network.  The output of any command is sent to both interfaces, not just the one that entered it.
+The menu system and all outputs are visible on the primary serial port and a web interface hosted on the device.  The output of any command is sent to both interfaces, not just the one that entered it.
+
+The device reaches that web interface either by joining an existing network or, when there is none to join, by hosting its own access point — which it does automatically at boot, so a board is usable over WiFi without a serial session at all.  See [WiFi](#wifi).
 
 ## Building and running
 
@@ -239,21 +241,77 @@ Stops PWM output on the specified pin, leaving it low, and releases the channel.
 
 This menu allows the user to perform actions on the wifi subsystem.
 
+The radio is either a station or an access point, never both: a single radio
+cannot sit on two channels, and an AP+station setup would silently drag the AP
+onto whatever channel the station associated on. `connect` therefore stops a
+running AP and `ap` drops a station association, each saying so as it happens.
+
 #### `scan`
 
 Scans nearby wifi APs and outputs each AP including the RSSI and channel information for each.
+
+Scanning is a station-mode operation, so it is refused while an access point is
+running; stop it with `wifi ap stop` first.
 
 #### `connect <AP> [Password]`
 
 Connects to the specified access point.  Connection status and IP address are reported to the user, including any disconnections or changes in the future.
 Disconnect reasons are decoded to readable text. Credentials are stored in NVS,
-so the device reconnects on its own after a reset. Omit the password for an open
-network.
+so `autostart` rejoins the same network after a reset. Omit the password for an
+open network. A running access point is stopped first.
+
+#### `ap <SSID> [password] [channel]`
+
+Hosts an access point so a laptop or phone can join the board directly and reach
+the web interface with no network in the middle — which is the point on a bench
+where there is no usable AP to join.
+
+The password is optional; omit it for an open network. WPA2 requires at least 8
+characters, and the SSID is limited to 32. The channel defaults to 1 and must be
+1–13. Because the password is positional, an open network on a specific channel
+is spelled with an empty password: `wifi ap bench "" 6`.
+
+Clients get addresses over DHCP from the device, which is `192.168.4.1`. The web
+console starts as soon as the AP is up — unlike station mode there is no lease to
+wait for — so `http://192.168.4.1/` is live immediately. Clients joining and
+leaving are reported as they happen, with their MAC address and AID.
+
+#### `ap stop`
+
+Stops the access point and returns the radio to station mode. The web server
+stays bound and becomes reachable again as soon as a station association
+provides an address.
+
+Note that stopping the AP disconnects any client using it — including the
+browser you typed the command into, if you reached the web console that way.
+
+#### `autostart`
+
+Joins the network stored in NVS, or hosts an access point when there is none.
+
+This runs automatically at boot, so a board is reachable over the web interface
+without a serial session at all. A board that has been through `wifi connect`
+comes back on the same network after a reset; a fresh one, or one whose network
+is out of range, raises its own access point instead:
+
+- SSID `esp-bringup-<xxxxxx>`, where the suffix is the low three bytes of the
+  board's soft AP MAC address, so several boards on a bench stay distinct
+- password `bringup1234` (compiled in, so it is a speed bump rather than
+  security — but better than an open console on a shared bench)
+- channel 1, address `192.168.4.1`
+
+The stored-network attempt uses a 10 second timeout rather than the 20 seconds
+`connect` allows, so a board that cannot reach its network starts hosting
+promptly. The command can be re-run by hand at any time.
 
 #### `status`
 
 Reports the current association — SSID, BSSID, RSSI, channel, security — plus
 the IP address, gateway and netmask.
+
+While an access point is running it reports that instead: the SSID, channel,
+security and address being advertised, followed by each connected client with
+its MAC address, DHCP-leased IP and signal strength.
 
 #### `iperf <server>[:<port>]`
 
@@ -755,6 +813,238 @@ sd mmc 7 9 8        # SD 1-bit on the same pins
 D1, D2 and D3 are not brought out on that board, so 4-bit mode cannot be
 exercised there even though the command supports it.
 
+### Audio
+
+Plays a tone or a frequency sweep out of an I2S codec or amplifier, and reports
+what the hardware actually did with it.
+
+This is a capability menu rather than a bus menu — it owns the I2S transport
+the way `sd` owns whichever bus a card is on. The generic commands here never
+mention a specific part: they work through a small codec interface, so a
+NAU8822 with sixty registers and an NS4168 with one enable pin are driven by
+the same `audio tone`, `audio volume` and `audio mute`. Parts appear as
+submenus (`audio nau8822`, `audio ns4168`) and attach themselves when
+initialized.
+
+**The wire is always two slots wide.** I2S has a genuine mono slot mode, but a
+stereo part fed one-slot frames plays everything an octave down at half speed,
+and every part this targets expects a two-slot frame. So there is no mono
+option; put the signal in one channel with `left` or `right` instead, which is
+also how you find out which slot a mono amplifier is listening to.
+
+#### `bus <bclk> <ws> <dout> [din <pin>] [mclk <pin>] [rate <hz>] [bits <16|24|32>] [mclkmult <n>]`
+
+Initializes I2S on the given pins. The rate defaults to 48000 Hz and the width
+to 16 bits. Re-running it tears the old configuration down first, so pins and
+format can be changed freely; an attached codec is reconfigured to match.
+
+`mclk` is needed by codecs that cannot synthesise a clock from BCLK alone — the
+NAU8822 is one — and unnecessary for a simple amplifier. `mclkmult` sets MCLK
+as a multiple of the sample rate; it defaults to 256, or 384 at 24 bits, which
+the driver requires to be a multiple of 3 for the rate to come out accurate.
+
+`din` is accepted and configured but not yet used. It is here because
+microphone capture reuses this same transport.
+
+**The transmitter starts immediately and keeps running.** With nothing queued
+the DMA sends silence, so BCLK and WS are live from this point on. That is what
+a codec wants — most of them mute or reset when their clocks stop, and starting
+and stopping the clock around every tone makes an amplifier pop — and it means
+the lines can be put on a scope before any signal is played.
+
+The clocks are reported as configured, not as requested:
+
+```
+> audio bus 41 43 42
+I2S initialized on BCLK=41, WS=43, DOUT=42
+Format:  48000 Hz requested, 48000 Hz configured, 16-bit, 2 slots
+Clocks:  BCLK 1.536 MHz, MCLK not routed to a pin
+Transmitting silence, so the clocks are live for the codec.
+```
+
+#### `info`
+
+Shows the pins, format, clocks, whether output is running, and the attached
+codec with its own status.
+
+#### `codecs`
+
+Lists the parts this firmware knows how to drive, which direction each works
+in, and whether it needs MCLK.
+
+#### `tone <hz> [seconds|continuous] [level <pct>] [left|right|both]`
+
+Plays a sine tone. The duration defaults to 3 seconds and the level to 25 % of
+full scale (−12 dBFS) — loud enough to hear, quiet enough not to hurt.
+
+`continuous` is the interruptible form. Commands execute one at a time, so a
+finite tone occupies the shell — serial *and* web — for its whole duration;
+a continuous one runs on its own task and is ended with `audio stop`.
+
+The signal is generated from a 1024-entry sine table with interpolation rather
+than by calling `sinf()`. The S3 has an FPU and would manage; the C3 has none,
+and softfloat there would spend a large part of a core generating the test
+signal, which is precisely when the question is whether the *hardware* keeps
+up. The table's error floor measures 90 dB below the signal, far under anything
+an amplifier under test contributes. Phase is a full 32-bit accumulator, so no
+frequency has to divide into the buffer length and block boundaries are
+inaudible, and every tone gets a 5 ms raised-cosine fade at each end so it does
+not thump the speaker.
+
+```
+> audio tone 1000 3
+Played 1000.0 Hz at 25% (-12.0 dBFS), 144000 frames
+Sample rate: 48000 requested, 48000 configured, 47999 measured
+```
+
+**The measured rate is the one worth reading.** The configured rate says what
+the divider was set to; the measured one says how fast samples actually left.
+It is timed between two moments when the DMA queue is equally full, so the
+buffer cancels out — timing the whole run instead would charge the prefill to
+the measurement and under-report by the buffer depth. A shortfall means
+something starved the DMA.
+
+#### `sweep <start_hz> <end_hz> [seconds] [level <pct>] [log|linear] [left|right|both]`
+
+Sweeps between two frequencies over 5 seconds by default. Logarithmic unless
+told otherwise, because equal time per octave is how audio hardware is judged.
+Frequency steps once per block of 256 frames — 5 ms at 48 kHz — with phase
+carried across, so there is no clicking at the steps.
+
+#### `stop`
+
+Ends a continuous tone, ramping it down rather than cutting it.
+
+#### `volume [pct]` and `mute [on|off]`
+
+Delegated to the attached codec. A part with no volume control says so and
+points at the generator's own `level` instead, which is a digital attenuation
+and always available.
+
+#### `close`
+
+Detaches the codec and releases I2S. The codec goes first: an amplifier still
+enabled when its clocks stop thumps the speaker.
+
+#### NAU8822
+
+Reached as `audio nau8822 ...`. Drives the Nuvoton NAU8822 stereo codec with
+speaker driver. Control is I2C at `0x1a` (CSB low) or `0x1b` (CSB high), so
+**the `i2c` menu's bus must be up first** — run `i2c bus <scl> <sda>` before
+`audio nau8822 init`. Audio arrives over I2S, so `audio bus` must be up too,
+and it must have an `mclk` pin: the part is a slave and has no way to make a
+system clock from BCLK alone. Without it every register write succeeds and
+nothing comes out, so `init` refuses rather than leaving you to find that.
+
+Registers are 7 address bits and 9 data bits packed into two bytes. The driver
+keeps a **shadow copy** of everything it writes. That is not an optimisation:
+several registers pack unrelated fields, and the family this part is
+register-compatible with — the WM8978 — is write-only, so without a shadow
+there would be no way to change one field without destroying its neighbours.
+
+Identity is handled the same careful way `sht4x serial` is. The device ID
+register is read first; if it answers, the part is identified outright. If it
+does not, an acknowledged write is the only remaining evidence, and both `init`
+and `status` say which of the two happened rather than implying more than was
+established.
+
+##### `init [address]`
+
+Resets the part, powers up the reference, bias and I/O buffer, configures the
+audio interface and clocking for the current `audio bus` format, sets the DAC
+to full scale, routes only the DAC into the output mixers — so a tone that
+comes out came from I2S and nowhere else — enables thermal shutdown on the
+speaker driver, and brings up both outputs.
+
+Volume is carried by the analog output attenuator, not the digital DAC volume:
+attenuating digitally throws away bits, and the question on a bench is usually
+whether the analog path works at all. 100 % is 0 dB; the six steps of gain
+above that are deliberately not reachable.
+
+##### `status`, `reg <n> [value]`, `route <hp|speaker|both>`
+
+`reg` reads or writes any of the 64 registers, showing both the shadow value
+and the live one where the part reads back, and flagging a difference between
+them. `route` chooses which output drivers are powered.
+
+#### NS4168
+
+Reached as `audio ns4168 ...`. A mono I2S class-D amplifier with **no control
+bus at all** — it takes BCLK, LRCK and SDATA and drives a speaker, and
+everything configurable about it is set by resistors on the board. It is the
+useful counterexample for the codec interface: if a part with one pin and no
+registers fits the same abstraction as a codec with sixty, the abstraction is
+at the right level. It implements mute and nothing else, and `audio volume`
+says plainly that there is no volume to set.
+
+##### `init [sd <pin>]`
+
+Attaches the amplifier and enables it. The I2S clocks must already be running:
+an amplifier enabled into a dead bus latches onto whatever the lines happen to
+be doing, and the ESP32 leaves them low.
+
+`sd` is the shutdown pin. Give it and `audio mute` works; omit it and the part
+is assumed hard-enabled, which is the case on boards that do not break it out —
+the Cardputer is one.
+
+Note that on many designs **the SD pin doubles as channel select** through a
+resistor divider, so which slot the amplifier plays is a board decision rather
+than a software one. `audio tone 1000 3 left` followed by the same with `right`
+is the quick way to find out which. On the Cardputer the answer is **right**:
+a left-only tone is silent there, and that is the board, not a fault.
+
+##### `status`
+
+Shows the enable pin and its state. It also says outright that nothing here
+confirms the part really is an NS4168 — with no control bus, there is no way to
+ask.
+
+### Board
+
+Known board pinouts, and presets that replay the commands which use them.
+
+Every command in this project takes explicit pin numbers, which is right for a
+tool whose job is to find out how a board is wired. Once a board *has* been
+worked out, though, retyping its pinout is only a way to make mistakes.
+
+**Selecting a board changes nothing.** `board cardputer` lists what is
+available; only `board cardputer audio` runs anything, and it echoes each line
+as it goes, so the preset is a shortcut for the commands rather than a
+replacement for knowing them:
+
+```
+> board cardputer audio
+> audio bus 41 43 42
+I2S initialized on BCLK=41, WS=43, DOUT=42
+...
+> audio ns4168 init
+NS4168 attached; no SD pin given, so it is assumed hard-enabled
+```
+
+#### `list`
+
+Lists the known boards. Each is a submenu; entering it shows the subsystems it
+has presets for.
+
+#### `<board> pins`
+
+Prints the pinout table. Pins carry a note where they came from a schematic
+rather than from having been exercised here — the Cardputer's SD and speaker
+pins have both been used in anger, its microphone pins have not. A signal that
+exists on the board but is not brought out to a GPIO is listed with a `-`
+rather than omitted, because "there is no enable pin" is an answer and a
+missing row is not.
+
+#### `<board> <subsystem>`
+
+Runs that subsystem's setup. A preset is refused when the firmware is built for
+a different chip than the board carries.
+
+Currently `cardputer` (M5Stack Cardputer: `pins`, `audio`, `sd`) and `xiao`
+(Seeed XIAO ESP32-S3 Sense: `pins`, `sd`). The XIAO has no speaker, so it has
+no audio preset; its PDM microphone waits for the capture side of the audio
+module.
+
 ### System
 
 #### `info`
@@ -782,9 +1072,19 @@ reported.
 
 ## Web interface
 
-Once the device has an IP address, a single-page console is served on port 80
-and advertised over mDNS as `esp-bringup.local`. Commands typed in the browser
+Once the device has an address, a single-page console is served on port 80 and
+advertised over mDNS as `esp-bringup.local`. Commands typed in the browser
 travel over a WebSocket at `/ws`.
+
+That address comes from either mode. As a station it is whatever DHCP handed
+out, reported by `wifi connect` and `wifi status`. As an access point it is
+always `192.168.4.1`, and the console is up the moment the AP is — there is no
+lease to wait for. If mDNS does not resolve (it often will not over an AP the
+client just joined), use the numeric address.
+
+Because `wifi autostart` runs at boot, a board with no reachable network is
+serving this page over its own AP within a few seconds of power-up. See
+[WiFi](#wifi) for the default SSID and password.
 
 Both interfaces feed the same command queue and share one output fan-out, so
 commands are executed one at a time and every line of output reaches the serial

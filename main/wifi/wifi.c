@@ -3,8 +3,10 @@
 #include "wifi.h"
 
 #include "esp_event.h"
+#include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_wifi_ap_get_sta_list.h"
 #include "nvs_flash.h"
 
 #include "lwip/inet.h"
@@ -18,6 +20,32 @@
 /* Long enough for a slow AP + DHCP, short enough not to wedge the console. */
 #define CONNECT_TIMEOUT_MS 20000
 
+/* Shorter than the interactive timeout: at boot a board that cannot reach its
+ * stored network should fall back to hosting its own AP promptly rather than
+ * leaving the user staring at nothing for 20 seconds. */
+#define BOOT_CONNECT_TIMEOUT_MS 10000
+
+#define AP_DEFAULT_CHANNEL 1
+#define AP_MAX_CLIENTS 4
+
+/*
+ * Field capacities taken from the driver's own config struct rather than
+ * hard-coded. The SSID needs no terminator (ssid_len carries the length), the
+ * password does.
+ */
+#define AP_SSID_MAX     (sizeof(((wifi_config_t *)0)->ap.ssid))
+#define AP_PASSWORD_MAX (sizeof(((wifi_config_t *)0)->ap.password) - 1)
+
+/* WPA2-PSK's own floor; the radio rejects anything shorter. */
+#define AP_MIN_PASSWORD_LEN 8
+
+/*
+ * Credentials for the AP raised by `autostart` when no stored network can be
+ * joined. Anyone with the source knows this password, so it is a speed bump
+ * rather than security -- but an open console is worse on a shared bench.
+ */
+#define BOOT_AP_PASSWORD "bringup1234"
+
 /* README: continuous mode reports every 5 seconds until interrupted. */
 #define IPERF_CONTINUOUS_INTERVAL_S 5
 #define IPERF_SINGLE_DURATION_S 10
@@ -26,8 +54,16 @@
 
 static bool wifi_started;
 static esp_netif_t *sta_netif;
+static esp_netif_t *ap_netif;
 static EventGroupHandle_t wifi_events;
 static iperf_id_t running_iperf = -1;
+
+/*
+ * AP and station mode are deliberately exclusive: one radio cannot sit on two
+ * channels, so an APSTA setup silently drags the AP onto whatever channel the
+ * station associated on. Each mode drops the other and says so.
+ */
+static bool ap_active;
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAILED_BIT    BIT1
@@ -105,6 +141,22 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         bp_web_start();
     } else if (base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
         bp_printf("WiFi: lost IP address\n");
+    } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_AP_START) {
+        /* Unlike a station, the AP owns its address the moment it is up, so
+         * there is no DHCP lease to wait for before serving. */
+        bp_web_start();
+    } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STACONNECTED) {
+        const wifi_event_ap_staconnected_t *event = event_data;
+
+        bp_printf("WiFi: client " MACSTR " joined the access point (AID %u)\n",
+                  MAC2STR(event->mac), event->aid);
+    } else if (base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+        const wifi_event_ap_stadisconnected_t *event = event_data;
+
+        bp_printf("WiFi: client " MACSTR " left the access point "
+                  "(AID %u, reason %u: %s)\n",
+                  MAC2STR(event->mac), event->aid, event->reason,
+                  disconnect_reason_name((uint8_t)event->reason));
     }
 }
 
@@ -151,10 +203,176 @@ static esp_err_t ensure_wifi_started(void)
     return ESP_OK;
 }
 
+/* Created on first use, so a board that never hosts an AP pays for neither the
+ * netif nor the DHCP server behind it. */
+static esp_err_t ensure_ap_netif(void)
+{
+    if (ap_netif) {
+        return ESP_OK;
+    }
+
+    ap_netif = esp_netif_create_default_wifi_ap();
+    return ap_netif ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+/*
+ * Bring the soft AP up. Shared by `ap` and `autostart`.
+ *
+ * An empty password means an open network. The caller has already validated
+ * lengths; what is left here is the mode switch, which drops any station
+ * association because the two modes are exclusive.
+ */
+static int start_ap(const char *ssid, const char *password, int channel)
+{
+    esp_err_t err = ensure_wifi_started();
+    if (err != ESP_OK) {
+        bp_error("Starting WiFi: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    err = ensure_ap_netif();
+    if (err != ESP_OK) {
+        bp_error("Creating the AP interface: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    wifi_ap_record_t associated;
+    if (esp_wifi_sta_get_ap_info(&associated) == ESP_OK) {
+        bp_printf("Leaving '%s'; access point mode is exclusive\n",
+                  (const char *)associated.ssid);
+    }
+
+    /* Unconditional: this also cancels an attempt still in flight, such as the
+     * failed autostart connect that led here. */
+    esp_wifi_disconnect();
+
+    wifi_config_t config = {0};
+    size_t ssid_len = strlen(ssid);
+
+    memcpy(config.ap.ssid, ssid, ssid_len);
+    config.ap.ssid_len = (uint8_t)ssid_len;
+    config.ap.channel = (uint8_t)channel;
+    config.ap.max_connection = AP_MAX_CLIENTS;
+    config.ap.authmode = WIFI_AUTH_OPEN;
+
+    if (password[0]) {
+        strlcpy((char *)config.ap.password, password, sizeof(config.ap.password));
+        config.ap.authmode = WIFI_AUTH_WPA2_PSK;
+        /* Capable but not required, so older clients still associate. */
+        config.ap.pmf_cfg.capable = true;
+        config.ap.pmf_cfg.required = false;
+    }
+
+    /*
+     * Stop, reconfigure, start -- the order the driver expects.
+     *
+     * esp_wifi_set_config() rejects an interface that is not active, so the mode
+     * has to change first; but changing mode on a *running* stack starts the AP
+     * immediately, which would briefly beacon whatever SSID was left in NVS (or
+     * a blank one on a fresh board) before our config lands. Stopping first
+     * means the AP only ever advertises what was asked for.
+     */
+    esp_wifi_stop();
+
+    err = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (err == ESP_OK) {
+        err = esp_wifi_set_config(WIFI_IF_AP, &config);
+    }
+    if (err == ESP_OK) {
+        err = esp_wifi_start();
+    }
+    if (err != ESP_OK) {
+        bp_error("Starting the access point: %s", esp_err_to_name(err));
+        /* Leave the radio somewhere predictable rather than half-configured. */
+        esp_wifi_set_mode(WIFI_MODE_STA);
+        esp_wifi_start();
+        return -1;
+    }
+
+    ap_active = true;
+
+    bp_printf("Access point '%s' up on channel %d (%s)\n", ssid, channel,
+              password[0] ? "WPA2" : "open");
+    if (password[0]) {
+        bp_printf("Password: %s\n", password);
+    }
+
+    /* The web server is started by the AP_START event; report where to find it. */
+    esp_netif_ip_info_t ip;
+    if (esp_netif_get_ip_info(ap_netif, &ip) == ESP_OK) {
+        bp_printf("AP IP:    " IPSTR "\n", IP2STR(&ip.ip));
+    }
+
+    return 0;
+}
+
+/*
+ * Join a configured network and wait for the outcome. The caller has already
+ * applied the credentials with esp_wifi_set_config().
+ */
+static int connect_and_wait(const char *ssid, int timeout_ms)
+{
+    /* Drop any existing association first so a connect can be re-run. */
+    esp_wifi_disconnect();
+
+    xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT | WIFI_FAILED_BIT);
+    connect_in_progress = true;
+
+    bp_printf("Connecting to '%s'...\n", ssid);
+
+    esp_err_t err = esp_wifi_connect();
+    if (err != ESP_OK) {
+        connect_in_progress = false;
+        bp_error("Connect failed: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    EventBits_t bits = xEventGroupWaitBits(
+        wifi_events, WIFI_CONNECTED_BIT | WIFI_FAILED_BIT,
+        pdFALSE, pdFALSE, pdMS_TO_TICKS(timeout_ms));
+
+    connect_in_progress = false;
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        /* The IP was already reported by the event handler. */
+        return 0;
+    }
+    if (bits & WIFI_FAILED_BIT) {
+        bp_error("Could not connect to '%s'", ssid);
+        return -1;
+    }
+
+    bp_error("Timed out after %d seconds waiting for '%s'", timeout_ms / 1000, ssid);
+    return -1;
+}
+
+/* Leave AP mode so a station operation can proceed. */
+static esp_err_t leave_ap_mode(void)
+{
+    if (!ap_active) {
+        return ESP_OK;
+    }
+
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    ap_active = false;
+    return ESP_OK;
+}
+
 int cmd_wifi_scan(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
+
+    /* The radio can only scan as a station, and AP mode is exclusive. Say so
+     * rather than surfacing a bare ESP_ERR_WIFI_MODE. */
+    if (ap_active) {
+        bp_error("Scanning requires station mode. Run 'wifi ap stop' first");
+        return -1;
+    }
 
     esp_err_t err = ensure_wifi_started();
     if (err != ESP_OK) {
@@ -218,6 +436,15 @@ int cmd_wifi_connect(int argc, char **argv)
         return -1;
     }
 
+    if (ap_active) {
+        bp_printf("Stopping the access point; station mode is exclusive\n");
+        err = leave_ap_mode();
+        if (err != ESP_OK) {
+            bp_error("Switching to station mode: %s", esp_err_to_name(err));
+            return -1;
+        }
+    }
+
     wifi_config_t config = {0};
     strlcpy((char *)config.sta.ssid, argv[1], sizeof(config.sta.ssid));
     if (argc > 2) {
@@ -230,39 +457,156 @@ int cmd_wifi_connect(int argc, char **argv)
         return -1;
     }
 
-    /* Drop any existing association first so `connect` can be re-run. */
-    esp_wifi_disconnect();
+    return connect_and_wait(argv[1], CONNECT_TIMEOUT_MS);
+}
 
-    xEventGroupClearBits(wifi_events, WIFI_CONNECTED_BIT | WIFI_FAILED_BIT);
-    connect_in_progress = true;
-
-    bp_printf("Connecting to '%s'...\n", argv[1]);
-
-    err = esp_wifi_connect();
-    if (err != ESP_OK) {
-        connect_in_progress = false;
-        bp_error("Connect failed: %s", esp_err_to_name(err));
+int cmd_wifi_ap(int argc, char **argv)
+{
+    if (argc < 2) {
+        bp_printf("Usage: ap <SSID> [password] [channel]\n");
+        bp_printf("       ap stop\n");
         return -1;
     }
 
-    EventBits_t bits = xEventGroupWaitBits(
-        wifi_events, WIFI_CONNECTED_BIT | WIFI_FAILED_BIT,
-        pdFALSE, pdFALSE, pdMS_TO_TICKS(CONNECT_TIMEOUT_MS));
+    if (strcasecmp(argv[1], "stop") == 0) {
+        if (!ap_active) {
+            bp_error("No access point is running");
+            return -1;
+        }
 
-    connect_in_progress = false;
+        esp_err_t err = leave_ap_mode();
+        if (err != ESP_OK) {
+            bp_error("Stopping the access point: %s", esp_err_to_name(err));
+            return -1;
+        }
 
-    if (bits & WIFI_CONNECTED_BIT) {
-        /* The IP was already reported by the event handler. */
+        /* The web server stays bound; it becomes reachable again as soon as a
+         * station association provides an address. */
+        bp_printf("Access point stopped\n");
         return 0;
     }
-    if (bits & WIFI_FAILED_BIT) {
-        bp_error("Could not connect to '%s'", argv[1]);
+
+    const char *ssid = argv[1];
+    size_t ssid_len = strlen(ssid);
+
+    if (ssid_len == 0 || ssid_len > AP_SSID_MAX) {
+        bp_error("SSID must be 1-%u characters", (unsigned)AP_SSID_MAX);
         return -1;
     }
 
-    bp_error("Timed out after %d seconds waiting for '%s'",
-             CONNECT_TIMEOUT_MS / 1000, argv[1]);
-    return -1;
+    const char *password = argc > 2 ? argv[2] : "";
+    size_t password_len = strlen(password);
+
+    /* An empty password is how you ask for an open network -- which also lets
+     * `ap <ssid> "" 6` reach the channel argument. */
+    if (password_len > 0 &&
+        (password_len < AP_MIN_PASSWORD_LEN || password_len > AP_PASSWORD_MAX)) {
+        bp_error("Password must be %d-%u characters, or empty for an open network",
+                 AP_MIN_PASSWORD_LEN, (unsigned)AP_PASSWORD_MAX);
+        return -1;
+    }
+
+    int channel = AP_DEFAULT_CHANNEL;
+    if (argc > 3) {
+        if (parse_int_arg(argv[3], &channel) < 0 || channel < 1 || channel > 13) {
+            bp_error("Channel must be 1-13");
+            return -1;
+        }
+    }
+
+    return start_ap(ssid, password, channel);
+}
+
+/* "esp-bringup-a4cf12", from the low three bytes of the soft AP MAC. */
+static void default_ap_ssid(char *out, size_t len)
+{
+    uint8_t mac[6] = {0};
+
+    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    snprintf(out, len, "esp-bringup-%02x%02x%02x", mac[3], mac[4], mac[5]);
+}
+
+int cmd_wifi_autostart(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    esp_err_t err = ensure_wifi_started();
+    if (err != ESP_OK) {
+        bp_error("Starting WiFi: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    /*
+     * Credentials are kept in NVS (esp_wifi_set_storage(WIFI_STORAGE_FLASH)),
+     * so esp_wifi_init() has already reloaded the last successful `connect`. A
+     * non-empty SSID means there is a network worth trying.
+     */
+    wifi_config_t stored = {0};
+    if (esp_wifi_get_config(WIFI_IF_STA, &stored) == ESP_OK && stored.sta.ssid[0]) {
+        if (connect_and_wait((const char *)stored.sta.ssid,
+                             BOOT_CONNECT_TIMEOUT_MS) == 0) {
+            return 0;
+        }
+        bp_printf("WiFi: falling back to the access point\n");
+    } else {
+        bp_printf("WiFi: no stored network, starting the access point\n");
+    }
+
+    char ssid[AP_SSID_MAX + 1];
+    default_ap_ssid(ssid, sizeof(ssid));
+
+    return start_ap(ssid, BOOT_AP_PASSWORD, AP_DEFAULT_CHANNEL);
+}
+
+/* The AP half of `status`: what we are advertising, and who has joined. */
+static int report_ap_status(void)
+{
+    wifi_config_t config = {0};
+    esp_err_t err = esp_wifi_get_config(WIFI_IF_AP, &config);
+    if (err != ESP_OK) {
+        bp_error("Reading the AP config: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    bp_printf("Mode:     access point\n");
+    bp_printf("SSID:     %.*s\n", config.ap.ssid_len, (const char *)config.ap.ssid);
+    bp_printf("Channel:  %u\n", config.ap.channel);
+    bp_printf("Security: %s\n", auth_mode_name(config.ap.authmode));
+
+    esp_netif_ip_info_t ip;
+    if (esp_netif_get_ip_info(ap_netif, &ip) == ESP_OK) {
+        bp_printf("IP:       " IPSTR "\n", IP2STR(&ip.ip));
+        bp_printf("Netmask:  " IPSTR "\n", IP2STR(&ip.netmask));
+    }
+
+    wifi_sta_list_t stations;
+    if (esp_wifi_ap_get_sta_list(&stations) != ESP_OK) {
+        return 0;
+    }
+
+    bp_printf("Clients:  %d of %d\n", stations.num, AP_MAX_CLIENTS);
+    if (stations.num == 0) {
+        return 0;
+    }
+
+    /* Pair the associations with the DHCP leases, so a client can be found by
+     * address and not just by MAC. */
+    wifi_sta_mac_ip_list_t leases = {0};
+    bool have_ips = esp_wifi_ap_get_sta_list_with_ip(&stations, &leases) == ESP_OK;
+
+    for (int i = 0; i < stations.num; i++) {
+        if (have_ips) {
+            bp_printf("  " MACSTR "  " IPSTR "  %d dBm\n",
+                      MAC2STR(stations.sta[i].mac), IP2STR(&leases.sta[i].ip),
+                      stations.sta[i].rssi);
+        } else {
+            bp_printf("  " MACSTR "  %d dBm\n", MAC2STR(stations.sta[i].mac),
+                      stations.sta[i].rssi);
+        }
+    }
+
+    return 0;
 }
 
 int cmd_wifi_status(int argc, char **argv)
@@ -273,6 +617,10 @@ int cmd_wifi_status(int argc, char **argv)
     if (!wifi_started) {
         bp_printf("WiFi is not started. Run 'wifi scan' or 'wifi connect' first.\n");
         return 0;
+    }
+
+    if (ap_active) {
+        return report_ap_status();
     }
 
     wifi_ap_record_t ap;
