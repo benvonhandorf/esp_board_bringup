@@ -64,9 +64,11 @@ Each menu has its own page in **[docs/](docs/README.md)**:
 | [board](docs/board.md) | Known board pinouts and per-subsystem setup presets | `cardputer`, `xiao` |
 | [system](docs/system.md) | Device information and control | |
 
-On a board you do not know, start with [`gpio survey`](docs/gpio.md#survey-pin):
-it measures every pin and reports what each one looks like before you have a
-pinout. What has been verified against real hardware is tracked in
+On a board nobody has powered before, **[Bringing up a new board](docs/bringup.md)**
+is the running order to follow: survey the pins, then the buses, then each part
+in turn. It starts with [`gpio survey`](docs/gpio.md#survey-pin), which measures
+every pin and reports what each one looks like before you have a pinout. What
+has been verified against real hardware is tracked in
 [HardwareSupport.md](HardwareSupport.md).
 
 ## Web interface

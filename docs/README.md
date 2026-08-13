@@ -21,9 +21,11 @@ the `.help` strings in `main/console/menu_table.c`.
 
 ## Where to start on an unknown board
 
-`gpio survey` first — it measures every pin and reports what each one looks
-like, without you having to know the pinout. [`board list`](board.md#list) then
-tells you whether this is a board the firmware already has a pinout for.
+**[Bringing up a new board](bringup.md)** is the guide: which tool to reach for
+in which order, and what each stage is capable of proving. In short, `gpio
+survey` first — it measures every pin and reports what each one looks like,
+without you having to know the pinout. [`board list`](board.md#list) then tells
+you whether this is a board the firmware already has a pinout for.
 
 Which parts have been exercised against real hardware, and which are written but
 unverified, is tracked in [HardwareSupport.md](../HardwareSupport.md).
