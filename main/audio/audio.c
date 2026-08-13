@@ -19,6 +19,8 @@
 
 #include "driver/gpio.h"
 
+#include <math.h>
+
 #define DEFAULT_RATE_HZ  48000
 #define DEFAULT_BITS     16
 #define DEFAULT_LEVEL_PCT 25
@@ -184,6 +186,51 @@ static void print_format(void)
     }
 }
 
+/* The receive side of `audio info`, and the tail of `audio pdm`. */
+static void print_input(void)
+{
+    switch (audio_bus_rx_mode()) {
+    case AUDIO_RX_NONE:
+        bp_printf("Input:   none. Add 'din <pin>' to 'audio bus', or run "
+                  "'audio pdm <clk> <data>'.\n");
+        return;
+
+    case AUDIO_RX_STD: {
+        int din = -1;
+        audio_bus_rx_pins(NULL, &din);
+        bp_printf("Input:   I2S on DIN=%d at %lu Hz, %u-bit%s\n", din,
+                  (unsigned long)audio_bus_rx_rate(), audio_bus_rx_bits(),
+                  audio_bus_rx_internal()
+                      ? " -- looped back inside the chip, nothing external" : "");
+        break;
+    }
+
+    case AUDIO_RX_PDM: {
+        int clk = -1;
+        int din = -1;
+        audio_bus_rx_pins(&clk, &din);
+        uint32_t pdm_hz = audio_bus_pdm_clk_hz();
+        bp_printf("Input:   PDM on CLK=%d, DATA=%d, decimated to %lu Hz "
+                  "16-bit\n", clk, din, (unsigned long)audio_bus_rx_rate());
+        bp_printf("         Microphone clock %.3f MHz\n", pdm_hz / 1e6);
+        /*
+         * The usual MEMS PDM part wants roughly 1 to 3.25 MHz and drops into a
+         * low-power mode below that, where it returns something that looks
+         * like a dead microphone. Saying so here is cheaper than debugging it.
+         */
+        if (pdm_hz && (pdm_hz < 1000000 || pdm_hz > 3250000)) {
+            bp_printf("         That is outside the 1-3.25 MHz most MEMS "
+                      "microphones specify; try a different rate if the part "
+                      "reads silent.\n");
+        }
+        break;
+    }
+    }
+
+    bp_printf("         %s\n", audio_bus_rx_enabled() ? "Receiver running"
+                                                      : "Receiver stopped");
+}
+
 int cmd_audio_bus(int argc, char **argv)
 {
     if (argc < 4) {
@@ -212,7 +259,16 @@ int cmd_audio_bus(int argc, char **argv)
         return -1;
     }
 
-    const int pins[] = {bclk, ws, dout, din, fmt.mclk_pin};
+    /*
+     * DIN on the same pin as DOUT is not a mistake: the I2S driver turns that
+     * into an internal loopback, feeding the transmitter straight back to the
+     * receiver through the pad. It is the one capture test that needs no
+     * hardware at all, which makes it the right first move when a microphone
+     * reads silent -- it separates a broken receive path from a broken part.
+     */
+    bool internal = (din >= 0 && din == dout);
+
+    const int pins[] = {bclk, ws, dout, internal ? -1 : din, fmt.mclk_pin};
     const char *const names[] = {"BCLK", "WS", "DOUT", "DIN", "MCLK"};
     for (int i = 0; i < 5; i++) {
         if (i == 3) {
@@ -231,6 +287,10 @@ int cmd_audio_bus(int argc, char **argv)
     if (!pins_distinct(pins, names, 5)) {
         return -1;
     }
+
+    /* Opening the standard bus releases a PDM microphone, because the two
+     * share the module's sample rate and this call may be changing it. */
+    bool had_pdm = (audio_bus_rx_mode() == AUDIO_RX_PDM);
 
     /* Reconfiguring the transport under a running tone would tear the channel
      * out from under the player task. */
@@ -267,6 +327,15 @@ int cmd_audio_bus(int argc, char **argv)
     bp_printf("\n");
     print_format();
     bp_printf("Transmitting silence, so the clocks are live for the codec.\n");
+    if (internal) {
+        bp_printf("DIN and DOUT are the same pin, so the receiver is fed by "
+                  "the transmitter through the pad. Nothing outside the chip "
+                  "is involved in what 'audio record' sees.\n");
+    }
+    if (had_pdm) {
+        bp_printf("The PDM microphone was released; re-run 'audio pdm' to "
+                  "bring it back at the new rate.\n");
+    }
 
     /* An attached part was configured for the old format; bring it in line. */
     if (active_codec && active_codec->configure) {
@@ -309,6 +378,8 @@ int cmd_audio_info(int argc, char **argv)
         bp_printf("Output:  %s\n", audio_bus_tx_enabled()
                   ? (audio_playing() ? "playing" : "running, silent") : "stopped");
     }
+
+    print_input();
 
     if (!active_codec) {
         bp_printf("Codec:   none attached (a bare I2S DAC or amplifier needs "
@@ -510,6 +581,450 @@ int cmd_audio_stop(int argc, char **argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* Capture                                                             */
+/* ------------------------------------------------------------------ */
+
+#define DEFAULT_RECORD_SECONDS 2.0
+#define DEFAULT_LEVEL_SECONDS  10.0
+#define LEVEL_TICK_SECONDS     0.1
+
+/*
+ * A PDM microphone drives a clock pin of its own, and that pin has to be free.
+ *
+ * This is not a theoretical check. On the M5Stack Cardputer the microphone's
+ * clock and the speaker's word-select are the same GPIO, so the two cannot run
+ * at once -- and the failure without this check is not an error but a
+ * plausible-looking silence, because the second peripheral quietly takes the
+ * pad away from the first and the amplifier starts seeing a megahertz square
+ * wave where its frame clock used to be.
+ */
+static bool pdm_pins_free(int clk, int din)
+{
+    if (!audio_bus_ready()) {
+        return true;
+    }
+
+    int bclk = -1;
+    int ws = -1;
+    int dout = -1;
+    int bus_din = -1;
+    int mclk = -1;
+    audio_bus_pins(&bclk, &ws, &dout, &bus_din, &mclk);
+
+    const int used[] = {bclk, ws, dout, mclk};
+    const char *const names[] = {"BCLK", "WS", "DOUT", "MCLK"};
+
+    for (size_t i = 0; i < sizeof(used) / sizeof(used[0]); i++) {
+        if (used[i] < 0) {
+            continue;
+        }
+        const char *role = (used[i] == clk) ? "clock"
+                         : (used[i] == din) ? "data line" : NULL;
+        if (!role) {
+            continue;
+        }
+
+        bp_error("GPIO %d is already the I2S %s, so it cannot also be the "
+                 "microphone's %s", used[i], names[i], role);
+        bp_printf("The two share a pin on this board, so the microphone and "
+                  "the speaker cannot run at the same time. Run 'audio close' "
+                  "to give up the speaker, or 'audio pdm' on the pins the "
+                  "microphone actually uses.\n");
+        return false;
+    }
+
+    return true;
+}
+
+int cmd_audio_pdm(int argc, char **argv)
+{
+    if (argc < 3) {
+        bp_printf("Usage: pdm <clk> <data> [rate <hz>]\n");
+        return -1;
+    }
+
+    int clk = 0;
+    int din = 0;
+    if (parse_int_arg(argv[1], &clk) < 0 || parse_int_arg(argv[2], &din) < 0) {
+        bp_error("CLK and DATA must be pin numbers");
+        return -1;
+    }
+    if (!GPIO_IS_VALID_OUTPUT_GPIO(clk)) {
+        bp_error("CLK: GPIO %d is not an output-capable pin on this chip", clk);
+        return -1;
+    }
+    if (!GPIO_IS_VALID_GPIO(din)) {
+        bp_error("DATA: GPIO %d is not a valid pin on this chip", din);
+        return -1;
+    }
+    if (clk == din) {
+        bp_error("CLK and DATA cannot both be GPIO %d", clk);
+        return -1;
+    }
+
+    /*
+     * The rate matters more here than it looks. It sets the microphone's own
+     * clock at 64 times itself, so it is also the knob that moves that clock
+     * into the range the part specifies.
+     */
+    audio_format_t fmt = {
+        .rate_hz = DEFAULT_RATE_HZ,
+        .bits = 16,
+        .mclk_pin = -1,
+        .mclk_multiple = 0,
+    };
+    const audio_format_t *existing = audio_bus_format();
+    if (existing) {
+        fmt.rate_hz = existing->rate_hz;
+    }
+
+    int index = 3;
+    while (index < argc) {
+        if (strcasecmp(argv[index], "rate") != 0) {
+            bp_error("Unexpected argument '%s'; the only option is 'rate <hz>'",
+                     argv[index]);
+            return -1;
+        }
+        if (index + 1 >= argc) {
+            bp_error("'rate' needs a value");
+            return -1;
+        }
+        int rate = 0;
+        if (parse_int_arg(argv[index + 1], &rate) < 0 ||
+            rate < MIN_RATE_HZ || rate > MAX_RATE_HZ) {
+            bp_error("Sample rate must be %d-%d Hz", MIN_RATE_HZ, MAX_RATE_HZ);
+            return -1;
+        }
+        if (existing && (uint32_t)rate != existing->rate_hz) {
+            bp_error("The I2S bus is already running at %lu Hz",
+                     (unsigned long)existing->rate_hz);
+            bp_printf("Capture and playback share one rate so that a loopback "
+                      "measurement means something. Re-run 'audio bus ... rate "
+                      "%d' to change both.\n", rate);
+            return -1;
+        }
+        fmt.rate_hz = (uint32_t)rate;
+        index += 2;
+    }
+
+    if (!pdm_pins_free(clk, din)) {
+        return -1;
+    }
+
+    esp_err_t err = audio_bus_open_pdm(clk, din, &fmt);
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        return -1;   /* the transport has already explained */
+    }
+    if (err != ESP_OK) {
+        bp_error("Opening the PDM microphone: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    err = audio_bus_rx_enable(true);
+    if (err != ESP_OK) {
+        bp_error("Starting the receiver: %s", esp_err_to_name(err));
+        audio_bus_rx_close();
+        return -1;
+    }
+
+    print_input();
+    bp_printf("Run 'audio record' to see what it hears.\n");
+    return 0;
+}
+
+/* A bare trailing number is the duration, as it is for `tone`. */
+static int take_seconds(int argc, char **argv, int index, double *seconds,
+                        double most)
+{
+    if (index >= argc) {
+        return 0;
+    }
+    if (index + 1 < argc) {
+        bp_error("Unexpected argument '%s'", argv[index + 1]);
+        return -1;
+    }
+    if (parse_double_arg(argv[index], seconds) < 0 || *seconds <= 0.0 ||
+        *seconds > most) {
+        bp_error("Duration must be greater than 0 and at most %.0f seconds",
+                 most);
+        return -1;
+    }
+    return 0;
+}
+
+int cmd_audio_record(int argc, char **argv)
+{
+    if (!audio_bus_rx_require()) {
+        return -1;
+    }
+
+    double seconds = DEFAULT_RECORD_SECONDS;
+    if (take_seconds(argc, argv, 1, &seconds, 60.0) < 0) {
+        return -1;
+    }
+
+    esp_err_t err = audio_bus_rx_enable(true);
+    if (err != ESP_OK) {
+        bp_error("Starting the receiver: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    /* Whatever is in the DMA now was captured before this command was typed,
+     * and on a freshly enabled receiver it is the part's start-up transient. */
+    audio_capture_flush(0.1);
+
+    audio_capture_req_t req = {
+        .seconds = seconds,
+        .detect_hz = 0.0,
+        .spectrum = true,
+    };
+    audio_capture_t cap;
+    audio_capture_run(&req, &cap);
+    audio_capture_report(&cap);
+    audio_capture_spectrum(&cap);
+
+    return cap.error == ESP_OK ? 0 : -1;
+}
+
+int cmd_audio_level(int argc, char **argv)
+{
+    if (!audio_bus_rx_require()) {
+        return -1;
+    }
+
+    double seconds = DEFAULT_LEVEL_SECONDS;
+    if (take_seconds(argc, argv, 1, &seconds, 120.0) < 0) {
+        return -1;
+    }
+
+    esp_err_t err = audio_bus_rx_enable(true);
+    if (err != ESP_OK) {
+        bp_error("Starting the receiver: %s", esp_err_to_name(err));
+        return -1;
+    }
+    audio_capture_flush(0.1);
+
+    /*
+     * A meter rather than a measurement. `record` answers "what is the input
+     * doing"; this answers "does it react to me", which is the question you
+     * actually have while tapping a microphone, and it needs the answer to
+     * arrive while your finger is still moving.
+     */
+    bp_printf("RMS per slot, ten times a second for %.0f s. Bars run from "
+              "-80 dBFS to 0.\n", seconds);
+
+    int ticks = (int)(seconds / LEVEL_TICK_SECONDS);
+    for (int i = 0; i < ticks; i++) {
+        audio_capture_req_t req = {
+            .seconds = LEVEL_TICK_SECONDS,
+            .detect_hz = 0.0,
+            .spectrum = false,
+        };
+        audio_capture_t cap;
+        if (audio_capture_run(&req, &cap) != ESP_OK) {
+            bp_error("Capture failed: %s", esp_err_to_name(cap.error));
+            return -1;
+        }
+
+        char bar[2][33];
+        double db[2];
+        for (int ch = 0; ch < 2; ch++) {
+            db[ch] = audio_dbfs(cap.stdev[ch], cap.full_scale);
+            int cells = (int)lrint((db[ch] + 80.0) / 80.0 * 32);
+            if (cells < 0) {
+                cells = 0;
+            }
+            if (cells > 32) {
+                cells = 32;
+            }
+            memset(bar[ch], '#', (size_t)cells);
+            bar[ch][cells] = '\0';
+        }
+        bp_printf("L %-32s %6.1f   R %-32s %6.1f\n", bar[0], db[0], bar[1],
+                  db[1]);
+    }
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Loopback                                                            */
+/* ------------------------------------------------------------------ */
+
+#define DEFAULT_LOOPBACK_HZ      1000.0
+#define DEFAULT_LOOPBACK_SECONDS 0.4
+#define LOOPBACK_SETTLE_SECONDS  0.2
+/* Below this the tone is indistinguishable from whatever was already there. */
+#define LOOPBACK_MARGINAL_DB     6.0
+#define LOOPBACK_HEARD_DB        12.0
+
+static double measure_tone(double hz, double seconds, double *level)
+{
+    audio_capture_req_t req = {
+        .seconds = seconds,
+        .detect_hz = hz,
+        .spectrum = false,
+    };
+    audio_capture_t cap;
+    if (audio_capture_run(&req, &cap) != ESP_OK) {
+        return NAN;
+    }
+
+    /* The louder slot is the answer: a mono microphone fills one of the two,
+     * and which one is a property of the board. Both are reported below. */
+    level[0] = cap.tone_dbfs[0];
+    level[1] = cap.tone_dbfs[1];
+    return fmax(cap.tone_dbfs[0], cap.tone_dbfs[1]);
+}
+
+int cmd_audio_loopback(int argc, char **argv)
+{
+    if (!audio_bus_require() || !audio_bus_rx_require()) {
+        return -1;
+    }
+
+    int dout = -1;
+    audio_bus_pins(NULL, NULL, &dout, NULL, NULL);
+    if (dout < 0) {
+        bp_error("The bus has no DOUT pin, so there is nothing to play");
+        return -1;
+    }
+
+    double hz = DEFAULT_LOOPBACK_HZ;
+    int index = 1;
+    if (argc > 1 && parse_double_arg(argv[1], &hz) == 0) {
+        index = 2;
+    }
+
+    audio_signal_t signal = {
+        .start_hz = hz,
+        .end_hz = hz,
+        .logarithmic = false,
+        .seconds = 0.0,          /* continuous; this command ends it */
+        .level_pct = DEFAULT_LEVEL_PCT,
+        .channel = AUDIO_CHANNEL_BOTH,
+        .quiet = true,
+    };
+    double window = DEFAULT_LOOPBACK_SECONDS;
+
+    while (index < argc) {
+        if (strcasecmp(argv[index], "level") == 0) {
+            if (index + 1 >= argc) {
+                bp_error("'level' needs a percentage");
+                return -1;
+            }
+            int pct = 0;
+            if (parse_int_arg(argv[index + 1], &pct) < 0 || pct < 1 || pct > 100) {
+                bp_error("Level must be 1-100 percent of full scale");
+                return -1;
+            }
+            signal.level_pct = pct;
+            index += 2;
+            continue;
+        }
+        if (parse_double_arg(argv[index], &window) < 0 || window <= 0.0 ||
+            window > 10.0) {
+            bp_error("Unexpected argument '%s'", argv[index]);
+            return -1;
+        }
+        index++;
+    }
+
+    if (!frequency_ok(hz, "Frequency")) {
+        return -1;
+    }
+    uint32_t rx_rate = audio_bus_rx_rate();
+    if (rx_rate && hz >= rx_rate / 2.0) {
+        bp_error("%.0f Hz is above the receiver's Nyquist limit of %.0f Hz",
+                 hz, rx_rate / 2.0);
+        return -1;
+    }
+    if (audio_playing()) {
+        bp_error("Something is already playing. Run 'audio stop' first.");
+        return -1;
+    }
+
+    esp_err_t err = audio_bus_rx_enable(true);
+    if (err != ESP_OK) {
+        bp_error("Starting the receiver: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    bp_printf("Testing whether the input hears %.0f Hz at %d%% from the "
+              "output.\n", hz, signal.level_pct);
+
+    /*
+     * Measure the same frequency twice, silent and then playing, and report
+     * the difference.
+     *
+     * A single measurement with the tone running cannot tell a microphone that
+     * hears the speaker from one sitting next to a switching supply that
+     * happens to whine near the test frequency. The quiet measurement is the
+     * control, and the difference between the two is the only part of this
+     * that is evidence.
+     */
+    audio_capture_flush(LOOPBACK_SETTLE_SECONDS);
+    double quiet[2];
+    double quiet_db = measure_tone(hz, window, quiet);
+
+    if (audio_play(&signal) != 0) {
+        return -1;
+    }
+
+    /* Let the transmit buffer drain into the wire and the part respond before
+     * believing anything the receiver says. */
+    audio_capture_flush(LOOPBACK_SETTLE_SECONDS);
+    double loud[2];
+    double loud_db = measure_tone(hz, window, loud);
+
+    audio_play_stop();
+
+    if (isnan(quiet_db) || isnan(loud_db)) {
+        bp_error("Capture failed during the measurement");
+        return -1;
+    }
+
+    bp_printf("\n%-8s %10s %10s %8s\n", "slot", "quiet", "playing", "change");
+    for (int ch = 0; ch < 2; ch++) {
+        bp_printf("%-8s %7.1f dB %7.1f dB %6.1f dB\n",
+                  ch == 0 ? "left" : "right", quiet[ch], loud[ch],
+                  loud[ch] - quiet[ch]);
+    }
+
+    double delta = loud_db - quiet_db;
+    int slot = (loud[1] - quiet[1]) > (loud[0] - quiet[0]) ? 1 : 0;
+
+    bp_printf("\n");
+    if (delta >= LOOPBACK_HEARD_DB) {
+        bp_printf("Heard it: %.0f Hz rose %.1f dB in the %s slot when the "
+                  "output started.\n", hz, delta, slot ? "right" : "left");
+        if (audio_bus_rx_internal()) {
+            bp_printf("This was the chip's internal loopback, so it proves the "
+                      "transmit and capture paths and nothing outside them.\n");
+        }
+        return 0;
+    }
+
+    if (delta >= LOOPBACK_MARGINAL_DB) {
+        bp_printf("Marginal: %.0f Hz rose only %.1f dB. Something is getting "
+                  "through, but not enough to call it a working path.\n",
+                  hz, delta);
+    } else {
+        bp_printf("Not heard: %.0f Hz did not rise when the output started.\n",
+                  hz);
+    }
+
+    /* The useful part of a negative result is knowing which half to suspect,
+     * and these are the questions in the order they are cheapest to answer. */
+    bp_printf("Check in this order: that the output is audible on its own "
+              "('audio tone %.0f 3'), that the input is alive ('audio record'), "
+              "and that the two are pointed at each other. Turning the level "
+              "up ('audio loopback %.0f level 80') is worth one try.\n",
+              hz, hz);
+    return -1;
+}
+
+/* ------------------------------------------------------------------ */
 /* Generic codec operations                                            */
 /* ------------------------------------------------------------------ */
 
@@ -628,12 +1143,13 @@ int cmd_audio_close(int argc, char **argv)
         audio_codec_detach();
     }
 
-    if (!audio_bus_ready()) {
+    bool had_rx = audio_bus_rx_ready();
+    if (!audio_bus_ready() && !had_rx) {
         bp_printf("I2S was not initialized.\n");
         return 0;
     }
 
     audio_bus_close();
-    bp_printf("I2S released.\n");
+    bp_printf("I2S released%s.\n", had_rx ? ", receiver included" : "");
     return 0;
 }

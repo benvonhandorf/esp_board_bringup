@@ -48,6 +48,7 @@ main/
     console_io.c      picks the serial transport from CONFIG_ESP_CONSOLE_*
     output.{c,h}      bp_printf/bp_error fan-out to console + registered sinks
   audio/              i2s_bus.c (transport), tone.c (signal generation),
+                      capture.c (input statistics, FFT, tone detection),
                       audio.c (the menu + codec registry),
                       codec_nau8822.c, codec_ns4168.c
   board/              board.c named pinouts and per-subsystem setup presets
@@ -140,6 +141,37 @@ and not project-wide.
   an amplifier. Do not "optimise" this into enabling TX only while playing.
 - **The I2S wire is always two slots.** `I2S_SLOT_MODE_MONO` is deliberately not
   offered; a stereo part fed one-slot frames plays an octave down at half speed.
+  Capture reports both slots separately for the same reason it matters on
+  output: which one a mono part lands in is a board fact to be discovered.
+- **There is one receiver, opened two ways.** `audio bus ... din <pin>` gives a
+  standard-mode receiver sharing BCLK and WS with the transmitter; `audio pdm`
+  gives a PDM one on a channel of its own. Opening the standard bus releases a
+  PDM microphone, because the two share the module's sample rate — capture and
+  playback must run at one rate or a loopback measurement means nothing.
+- **PDM needs `SOC_I2S_SUPPORTS_PDM2PCM`, not just `SOC_I2S_SUPPORTS_PDM_RX`.**
+  The ESP32-C3 has the second and not the first, so it would deliver a raw
+  bitstream that every statistic in `capture.c` would misreport as sound;
+  `audio_bus_open_pdm()` refuses there rather than returning plausible numbers.
+- **`din == dout` is an internal loopback**, not an error to reject. The I2S
+  driver wires the transmitter back to the receiver through the pad, which is
+  the only capture test needing no hardware, so `pins_distinct()` exempts that
+  pair and the result is labelled as proving nothing external.
+- **Analysis runs after the capture, never during it.** `capture.c` streams
+  integer statistics while reading and does the FFT afterwards on a buffered
+  window. A filter bank running per sample would starve the DMA on a chip with
+  no FPU. Do not move the transform into the read loop.
+- **The spectrum is band power, not per-band probes.** Every FFT bin is assigned
+  to exactly one half-octave band. An earlier version sampled each band at one
+  frequency and read a tone falling between two probes 89 dB low; the host test
+  in the scratchpad covers that case, so keep it covered.
+- **`audio loopback` measures the target frequency twice**, silent then playing,
+  and reports the difference. Only the change is evidence — a single reading
+  cannot separate a microphone hearing the speaker from a supply whining near
+  the test frequency.
+- **A pin conflict between capture and playback is a real board case**, not a
+  hypothetical: on the Cardputer the microphone clock and the speaker's
+  word-select are both GPIO 43. `pdm_pins_free()` refuses, because the
+  unguarded failure is a plausible silence rather than an error.
 - **Board presets call `bp_menu_execute()` directly**, never
   `bp_console_submit(line, true)` — a preset already runs on the executor task,
   and waiting there for that task to drain its own queue deadlocks.

@@ -357,7 +357,9 @@ static void player_task(void *arg)
 
     play_result_t result;
     run_player(&result);
-    report(&result);
+    if (!player.signal.quiet) {
+        report(&result);
+    }
 
     player.running = false;
     xSemaphoreGive(player.finished);
@@ -396,7 +398,9 @@ int audio_play(const audio_signal_t *signal)
     if (signal->seconds > 0.0) {
         play_result_t result;
         run_player(&result);
-        report(&result);
+        if (!signal->quiet) {
+            report(&result);
+        }
         player.running = false;
         return result.error == ESP_OK ? 0 : -1;
     }
@@ -423,7 +427,9 @@ int audio_play(const audio_signal_t *signal)
         return -1;
     }
 
-    bp_printf("Playing continuously. Enter 'audio stop' to end it.\n");
+    if (!signal->quiet) {
+        bp_printf("Playing continuously. Enter 'audio stop' to end it.\n");
+    }
     return 0;
 }
 

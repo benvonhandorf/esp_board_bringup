@@ -203,6 +203,7 @@ static const bp_menu_t ns4168_menu = {
 static const bp_command_t audio_commands[] = {
     {"bus", "<bclk> <ws> <dout> [din <pin>] [mclk <pin>] [rate <hz>] [bits <n>]",
      "Initialize I2S and start its clocks", cmd_audio_bus},
+    {"pdm", "<clk> <data> [rate <hz>]", "Receive from a PDM microphone", cmd_audio_pdm},
     {"info", "", "Show pins, format, clocks and the attached codec", cmd_audio_info},
     {"codecs", "", "List the parts this firmware can drive", cmd_audio_codecs},
     {"tone", "<hz> [seconds|continuous] [level <pct>] [left|right|both]",
@@ -210,6 +211,11 @@ static const bp_command_t audio_commands[] = {
     {"sweep", "<start_hz> <end_hz> [seconds] [level <pct>] [log|linear]",
      "Sweep a sine tone between two frequencies", cmd_audio_sweep},
     {"stop", "", "End a continuous tone", cmd_audio_stop},
+    {"record", "[seconds]", "Capture the input and report levels and a spectrum",
+     cmd_audio_record},
+    {"level", "[seconds]", "Live input level meter", cmd_audio_level},
+    {"loopback", "[hz] [seconds] [level <pct>]",
+     "Play a tone and measure whether the input hears it", cmd_audio_loopback},
     {"volume", "[pct]", "Show or set the codec's output volume", cmd_audio_volume},
     {"mute", "[on|off]", "Mute or unmute the codec", cmd_audio_mute},
     {"close", "", "Detach the codec and release I2S", cmd_audio_close},
@@ -219,7 +225,7 @@ static const bp_menu_t *const audio_submenus[] = {&nau8822_menu, &ns4168_menu};
 
 static const bp_menu_t audio_menu = {
     .name = "audio",
-    .help = "Audio output over I2S: tone and sweep testing through a codec or amplifier",
+    .help = "Audio over I2S: tone, sweep, microphone capture and loopback testing",
     .commands = audio_commands,
     .command_count = ARRAY_COUNT(audio_commands),
     .submenus = audio_submenus,
@@ -229,6 +235,7 @@ static const bp_menu_t audio_menu = {
 static const bp_command_t cardputer_commands[] = {
     {"pins", "", "Show the known pinout", cmd_board_cardputer_pins},
     {"audio", "", "Set up I2S and the NS4168 speaker amplifier", cmd_board_cardputer_audio},
+    {"mic", "", "Open the SPM1423 PDM microphone (releases the speaker)", cmd_board_cardputer_mic},
     {"sd", "", "Bring the microSD slot up over SPI", cmd_board_cardputer_sd},
 };
 
@@ -241,6 +248,7 @@ static const bp_menu_t cardputer_menu = {
 
 static const bp_command_t xiao_commands[] = {
     {"pins", "", "Show the known pinout", cmd_board_xiao_pins},
+    {"mic", "", "Open the PDM microphone", cmd_board_xiao_mic},
     {"sd", "", "Bring the microSD slot up over SPI", cmd_board_xiao_sd},
 };
 

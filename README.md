@@ -815,8 +815,9 @@ exercised there even though the command supports it.
 
 ### Audio
 
-Plays a tone or a frequency sweep out of an I2S codec or amplifier, and reports
-what the hardware actually did with it.
+Plays a tone or a frequency sweep out of an I2S codec or amplifier, captures
+from a microphone or an ADC, and reports what the hardware actually did with
+either.
 
 This is a capability menu rather than a bus menu — it owns the I2S transport
 the way `sd` owns whichever bus a card is on. The generic commands here never
@@ -843,8 +844,15 @@ NAU8822 is one — and unnecessary for a simple amplifier. `mclkmult` sets MCLK
 as a multiple of the sample rate; it defaults to 256, or 384 at 24 bits, which
 the driver requires to be a multiple of 3 for the rate to come out accurate.
 
-`din` is accepted and configured but not yet used. It is here because
-microphone capture reuses this same transport.
+`din` adds a receiver sharing the same BCLK and WS — an I2S microphone such as
+the SPH0645, or a codec's ADC. A PDM microphone is a different mode and has its
+own command, `audio pdm`.
+
+**Setting `din` to the same pin as `dout` is an internal loopback.** The I2S
+driver notices and feeds the transmitter straight back to the receiver through
+the pad, with nothing connected. That is the one capture test that needs no
+hardware at all, which makes it the right first move when a microphone reads
+silent: it separates a broken receive path from a broken part.
 
 **The transmitter starts immediately and keeps running.** With nothing queued
 the DMA sends silence, so BCLK and WS are live from this point on. That is what
@@ -914,6 +922,124 @@ carried across, so there is no clicking at the steps.
 #### `stop`
 
 Ends a continuous tone, ramping it down rather than cutting it.
+
+#### `pdm <clk> <data> [rate <hz>]`
+
+Opens a PDM microphone — the SPM1423 on the Cardputer, the one on the XIAO
+Sense. PDM is not I2S with different pins: the part is clocked at a few
+megahertz on a single line and sends one bit per clock, and the peripheral's
+decimation filter turns that back into PCM. So it gets its own receiver rather
+than joining the standard bus, and its own command.
+
+The rate is the *decimated* rate, and it sets the microphone's own clock at 64
+times itself — 48 kHz gives 3.072 MHz. That matters, because a MEMS PDM part
+typically specifies 1 to 3.25 MHz and drops into a low-power mode below that,
+where it looks exactly like a dead microphone. The command reports the clock it
+produced and says so when it lands outside that range.
+
+If the standard bus is already open, the microphone inherits its sample rate.
+Capture and playback share one rate deliberately: a loopback measured at two
+different rates would not mean anything.
+
+```
+> audio pdm 43 46
+Input:   PDM on CLK=43, DATA=46, decimated to 48000 Hz 16-bit
+         Microphone clock 3.072 MHz
+         Receiver running
+```
+
+**A PDM microphone has no control interface, so it has no driver here.** There
+are no registers, no address, no enable — the transport is the whole of it.
+That is why there is no `audio spm1423` submenu to match `audio ns4168`: the
+NS4168 earned a driver by having one pin, and this part does not have even
+that. The same applies to an I2S microphone, which `audio bus ... din <pin>`
+covers outright.
+
+On the ESP32-C3 this refuses. The chip can clock a PDM microphone but has no
+PDM-to-PCM filter, so what arrives is the raw one-bit stream; every statistic
+below would be measuring the modulator rather than the sound, and would look
+like plausible numbers while meaning nothing.
+
+#### `record [seconds]`
+
+Captures the input and reports what was in it. Two seconds by default.
+
+Both slots are always reported separately. A mono microphone fills one of them
+and which one is a board fact, discovered the same way `audio tone ... left`
+discovers which slot a mono amplifier plays.
+
+```
+> audio record 2
+Captured 96000 frames at 48000 Hz from PDM microphone, 16-bit (full scale 32768)
+slot           min         max      mean      stdev        rms      peak
+left          -412         398      -1.8       58.3     -55.0 dB  -38.3 dB
+right            0           0       0.0        0.0    -120.0 dB -120.0 dB
+```
+
+RMS is quoted about the mean, which is why the column is also labelled stdev. A
+microphone with a DC offset is normal and says nothing about the signal;
+counting that offset as level would make a silent part look like a loud one.
+
+For scale, the Cardputer's SPM1423 in a quiet room sits between −62 and −70
+dBFS and rises to about −33 dBFS when someone talks at it, on a DC offset of
+roughly 1300 counts. A **stuck** input is called out explicitly rather than
+left to be inferred, because it is the commonest way for one to be wrong and it
+reads confusingly otherwise — RMS floors at −120 dB while peak sits near 0 dB,
+peak being measured from zero for headroom and a dead line being nearly all
+offset:
+
+```
+> audio record 1
+slot           min         max      mean      stdev          rms       peak
+left        -30935      -30935  -30935.0        0.0    -120.0 dB    -0.5 dB
+The left slot never changed -- every one of 48000 samples read -30935. Nothing
+is modulating this input: check that the part is clocked and that the data pin
+is the right one.
+```
+
+Below the table is a spectrum in half-octave bands. Every FFT bin lands in
+exactly one band, so a band is the *total power* in that half octave rather
+than the level at its centre — which means a tone anywhere inside a band shows
+up at its real level, and the bands sum to the broadband RMS above them. Both
+of those are checked host-side; the first version of this probed each band at
+one frequency and read a tone between two probes 89 dB low, which is the kind
+of display that gets a working microphone thrown away.
+
+#### `level [seconds]`
+
+A meter rather than a measurement: one line per 100 ms with a bar per slot.
+`record` answers "what is the input doing"; this answers "does it react to
+me", which is the question you actually have while tapping a microphone, and
+it needs the answer to arrive while your finger is still moving.
+
+#### `loopback [hz] [seconds] [level <pct>]`
+
+Plays a tone and measures whether the input hears it. This is the end-to-end
+test: output, air or wire, input, all in one command.
+
+It measures the same frequency **twice** — once with the output silent, once
+with it playing — and reports the difference. That control is the whole point.
+A single measurement with the tone running cannot tell a microphone that hears
+the speaker from one sitting next to a switching supply that happens to whine
+near the test frequency; only the change between the two is evidence.
+
+```
+> audio loopback 1000
+Testing whether the input hears 1000 Hz at 25% from the output.
+
+slot          quiet    playing   change
+left         -120.0     -120.0      0.0
+right         -78.4      -13.1     65.3
+
+Heard it: 1000 Hz rose 65.3 dB in the right slot when the output started.
+```
+
+A rise of 12 dB or more counts as heard, 6 to 12 dB as marginal, and less than
+that as not heard. A negative result comes with the checks to make in the order
+they are cheapest to answer.
+
+Both a transmitter and a receiver have to be up, and on some boards that is
+impossible — see the Cardputer below.
 
 #### `volume [pct]` and `mute [on|off]`
 
@@ -1029,8 +1155,10 @@ has presets for.
 #### `<board> pins`
 
 Prints the pinout table. Pins carry a note where they came from a schematic
-rather than from having been exercised here — the Cardputer's SD and speaker
-pins have both been used in anger, its microphone pins have not. A signal that
+rather than from having been exercised here — every pin on the Cardputer has
+now been used in anger, the microphone's by clocking it from a *different*
+GPIO and watching the data go perfectly static, which is what distinguishes
+"this is the clock pin" from "the schematic says so". A signal that
 exists on the board but is not brought out to a GPIO is listed with a `-`
 rather than omitted, because "there is no enable pin" is an answer and a
 missing row is not.
@@ -1040,10 +1168,18 @@ missing row is not.
 Runs that subsystem's setup. A preset is refused when the firmware is built for
 a different chip than the board carries.
 
-Currently `cardputer` (M5Stack Cardputer: `pins`, `audio`, `sd`) and `xiao`
-(Seeed XIAO ESP32-S3 Sense: `pins`, `sd`). The XIAO has no speaker, so it has
-no audio preset; its PDM microphone waits for the capture side of the audio
-module.
+Currently `cardputer` (M5Stack Cardputer: `pins`, `audio`, `mic`, `sd`) and
+`xiao` (Seeed XIAO ESP32-S3 Sense: `pins`, `mic`, `sd`). The XIAO has no
+speaker, so it has no audio output preset.
+
+**The Cardputer cannot record its own speaker.** GPIO 43 carries the speaker's
+word-select *and* the microphone's clock, so only one of the two can have the
+pad at a time — `board cardputer audio` and `board cardputer mic` are mutually
+exclusive, and `audio loopback` has nothing to work with there. `audio pdm`
+refuses with that explanation rather than letting the second peripheral quietly
+take the pin from the first, which is the failure worth preventing: it is not
+an error but a plausible silence, with the amplifier seeing a megahertz square
+wave where its frame clock used to be.
 
 ### System
 

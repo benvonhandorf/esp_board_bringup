@@ -25,8 +25,8 @@
 /* ------------------------------------------------------------------ */
 
 /*
- * Shared by playback and (later) capture, so a microphone reuses the bus
- * configuration rather than describing its own.
+ * Shared by playback and capture, so a microphone reuses the bus configuration
+ * rather than describing its own.
  */
 typedef struct {
     uint32_t rate_hz;      /* requested sample rate */
@@ -46,12 +46,22 @@ typedef struct {
  * which slot a mono amplifier is listening to.
  */
 
-/* Which directions a part can work in. TX only for now; RX is what the
- * microphone support in HardwareSupport.md will set. */
+/* Which directions a part can work in. */
 typedef enum {
     AUDIO_DIR_TX = 1 << 0,
     AUDIO_DIR_RX = 1 << 1,
 } audio_dir_t;
+
+/*
+ * How the receiver is wired, which is not a detail the analysis code can
+ * ignore: a PDM microphone brings its own clock and its own sample width, and
+ * an I2S receiver shares the transmitter's.
+ */
+typedef enum {
+    AUDIO_RX_NONE,
+    AUDIO_RX_STD,   /* I2S standard mode, sharing BCLK and WS with the transmitter */
+    AUDIO_RX_PDM,   /* PDM microphone: one clock out, one data line in */
+} audio_rx_mode_t;
 
 /* ------------------------------------------------------------------ */
 /* Codec interface                                                     */
@@ -148,6 +158,47 @@ esp_err_t audio_bus_write(const void *data, size_t bytes, size_t *written,
                           uint32_t timeout_ms);
 
 /* ------------------------------------------------------------------ */
+/* Receive (i2s_bus.c)                                                 */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Open a PDM microphone. This allocates a receiver of its own rather than
+ * joining the standard bus, because PDM is a different mode: the part is
+ * clocked at a few megahertz on a single line and the peripheral decimates it
+ * down to PCM. Refuses if either pin is already carrying a standard-mode
+ * signal, which is not a hypothetical -- on the Cardputer the microphone clock
+ * and the speaker word-select are the same GPIO.
+ */
+esp_err_t audio_bus_open_pdm(int clk, int din, const audio_format_t *fmt);
+void audio_bus_rx_close(void);
+
+audio_rx_mode_t audio_bus_rx_mode(void);
+bool audio_bus_rx_ready(void);
+bool audio_bus_rx_require(void);
+
+/* True when DIN and DOUT are the same pin, which the I2S driver turns into an
+ * internal loopback: the transmitter feeds the receiver through the pad with
+ * nothing connected. Worth reporting, because a capture that succeeds this way
+ * says nothing at all about anything outside the chip. */
+bool audio_bus_rx_internal(void);
+
+void audio_bus_rx_pins(int *clk, int *din);
+uint32_t audio_bus_rx_rate(void);        /* achieved, from the driver */
+
+/* The clock on the microphone's own pin, which is what its datasheet puts
+ * limits on -- a MEMS PDM part typically wants 1 to 3.25 MHz and sleeps below
+ * that. Zero unless a PDM microphone is open. */
+uint32_t audio_bus_pdm_clk_hz(void);
+
+uint8_t audio_bus_rx_bits(void);         /* valid data bits per sample */
+size_t audio_bus_rx_frame_bytes(void);   /* two slots, as on the transmit side */
+
+esp_err_t audio_bus_rx_enable(bool enable);
+bool audio_bus_rx_enabled(void);
+esp_err_t audio_bus_read(void *data, size_t bytes, size_t *read,
+                         uint32_t timeout_ms);
+
+/* ------------------------------------------------------------------ */
 /* Test signals (tone.c)                                               */
 /* ------------------------------------------------------------------ */
 
@@ -164,6 +215,10 @@ typedef struct {
     double seconds;     /* 0 means continuous, ended by audio_play_stop() */
     int level_pct;      /* digital amplitude, 1-100 */
     audio_channel_t channel;
+    /* Suppress the per-run report. `audio loopback` drives the generator as one
+     * step of a larger measurement and prints its own conclusion; a playback
+     * summary arriving in the middle of that is noise. */
+    bool quiet;
 } audio_signal_t;
 
 /*
@@ -176,10 +231,86 @@ int audio_play_stop(void);
 bool audio_playing(void);
 
 /* ------------------------------------------------------------------ */
+/* Capture and analysis (capture.c)                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Half-octave probe frequencies for the ASCII spectrum, from 31.25 Hz up to
+ * whatever falls below Nyquist. Twenty of them reach 22.6 kHz, which covers
+ * every sample rate this tool offers.
+ */
+#define AUDIO_BANDS 20
+
+typedef struct {
+    double seconds;
+    double detect_hz;   /* 0 skips the single-frequency detector */
+    bool spectrum;      /* run the probe bank */
+} audio_capture_req_t;
+
+/*
+ * Both slots are analysed separately and always reported. A mono microphone
+ * only fills one of them, and which one is a board fact worth discovering the
+ * same way `audio tone ... left` discovers which slot a mono amplifier plays.
+ *
+ * Amplitudes are in raw sample counts, with full_scale saying what 0 dBFS is,
+ * because that is the number a datasheet is written in. dBFS is derived for
+ * display.
+ */
+typedef struct {
+    uint64_t frames;
+    uint32_t rate;
+    uint8_t bits;
+    double full_scale;      /* counts at 0 dBFS */
+
+    int32_t min[2];
+    int32_t max[2];
+    double mean[2];         /* DC offset, counts */
+    double stdev[2];        /* RMS about the mean, counts */
+    double peak[2];         /* largest excursion from zero, counts */
+    uint64_t clipped[2];    /* samples at or beyond full scale */
+
+    /*
+     * Frequency-domain results are in dBFS rather than counts. They come from a
+     * fixed-length window analysed at 16-bit resolution whatever the stream's
+     * width, so counts would be in different units from the ones above; a
+     * relative level is the same number either way.
+     */
+    double detect_hz;
+    double tone_dbfs[2];
+
+    uint32_t band_count;
+    double band_hz[AUDIO_BANDS];
+    double band_dbfs[2][AUDIO_BANDS];
+    uint64_t analysed;            /* frames the probe bank actually saw */
+
+    int overruns;           /* reads that timed out; the DMA lost samples */
+    esp_err_t error;
+} audio_capture_t;
+
+/* Reported instead of -inf, so a silent channel still lines up in a column. */
+#define AUDIO_DBFS_FLOOR (-120.0)
+
+esp_err_t audio_capture_run(const audio_capture_req_t *req, audio_capture_t *out);
+void audio_capture_report(const audio_capture_t *cap);
+void audio_capture_spectrum(const audio_capture_t *cap);
+
+/* Throw away whatever the DMA has queued, so a measurement starts on samples
+ * taken after whatever just changed rather than before it. */
+void audio_capture_flush(double seconds);
+
+/* Counts to dBFS, floored rather than running to -inf so a column stays a
+ * column. Returns the floor for silence. */
+double audio_dbfs(double amplitude, double full_scale);
+
+/* ------------------------------------------------------------------ */
 /* Commands                                                            */
 /* ------------------------------------------------------------------ */
 
 int cmd_audio_bus(int argc, char **argv);
+int cmd_audio_pdm(int argc, char **argv);
+int cmd_audio_record(int argc, char **argv);
+int cmd_audio_level(int argc, char **argv);
+int cmd_audio_loopback(int argc, char **argv);
 int cmd_audio_info(int argc, char **argv);
 int cmd_audio_codecs(int argc, char **argv);
 int cmd_audio_tone(int argc, char **argv);

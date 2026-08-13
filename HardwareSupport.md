@@ -23,19 +23,34 @@ Implemented: `audio ns4168`. No control bus; optional shutdown pin.
 Support both mono and stereo setups.
 Sample the microphone for several seconds and report min, max, stdev of the audio data as well as an ASCII frequency plot for simple debugging and to ensure audio data is being received.
 
-Not implemented. The transport is already in place: `main/audio/i2s_bus.c`
-carries an RX channel handle alongside TX and `audio bus` accepts a `din <pin>`
-argument, so this needs a read path and a PDM init variant there, capture and
-analysis commands in the `audio` menu, and `AUDIO_DIR_RX` codec entries — not a
-restructure.
+**Implemented** as `audio record`, `audio level` and `audio loopback` — see
+[README](README.md#audio). Both slots are always reported separately, so a mono
+part's slot is discovered rather than assumed. `record` gives min, max, mean,
+stdev, RMS and peak plus a half-octave power spectrum; `loopback` plays a tone
+and measures whether the input hears it, against a silent control.
 
 ### PDM Microphones
 
 e.g. SPM1423
 
+Implemented: `audio pdm <clk> <data>`. No control interface exists on these
+parts, so there is no driver and no submenu — the transport is the whole of it.
+Requires a hardware PDM-to-PCM filter, which the ESP32-C3 lacks.
+
 ### I2S Microphones
 
 e.g. Knowles SPH0645LM4H-B I2S Microphone
+
+Implemented: `audio bus <bclk> <ws> <dout> din <pin> bits 32`. Also driverless.
+
+### Loopback
+
+`audio loopback` needs a transmitter and a receiver at once, which is not
+always possible: on the M5Stack Cardputer the microphone clock and the
+speaker's word-select are the same GPIO, so that board cannot record its own
+speaker. `audio bus ... din <dout pin>` is the fallback that always works — the
+I2S driver loops the transmitter back internally, which tests the capture path
+without testing anything outside the chip.
 
 ## Displays
 

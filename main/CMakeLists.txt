@@ -15,6 +15,7 @@ idf_component_register(
         "audio/audio.c"
         "audio/i2s_bus.c"
         "audio/tone.c"
+        "audio/capture.c"
         "audio/codec_nau8822.c"
         "audio/codec_ns4168.c"
         "board/board.c"

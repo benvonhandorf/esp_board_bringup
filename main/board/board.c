@@ -45,9 +45,18 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 
 /*
- * M5Stack Cardputer. The SD pins are the ones measured for the benchmark table
- * in the README; the speaker pins have had a tone played out of them. Only the
- * microphone pins are still taken on the schematic's word.
+ * M5Stack Cardputer. Every pin here has now been exercised: the SD pins by the
+ * benchmark table in the README, the speaker pins by a tone, and the
+ * microphone pins by clocking them from the wrong GPIO and watching the data
+ * go completely static -- 48000 consecutive samples of -30935 with the clock
+ * elsewhere, real varying audio with it on 43. That is what confirms 43 and 46
+ * rather than the schematic's word for them.
+ *
+ * GPIO 43 carries the speaker's word-select and the microphone's clock, which
+ * is a board decision with a consequence no amount of software can undo: the
+ * two cannot run at the same time, so this board cannot record its own
+ * speaker. `audio pdm` refuses rather than letting the second peripheral take
+ * the pad away from the first.
  */
 static const board_pin_t cardputer_pins[] = {
     {"SD CLK", 40, NULL},
@@ -55,11 +64,11 @@ static const board_pin_t cardputer_pins[] = {
     {"SD MISO", 39, NULL},
     {"SD CS", 12, NULL},
     {"Speaker BCLK", 41, NULL},
-    {"Speaker WS/LRCK", 43, NULL},
+    {"Speaker WS/LRCK", 43, "also the microphone clock; only one at a time"},
     {"Speaker DATA", 42, "amplifier plays the RIGHT slot; left is silent"},
     {"Speaker SD/enable", -1, "not broken out; the amplifier is always on"},
-    {"Mic PDM CLK", 43, "shared with the speaker WS line"},
-    {"Mic PDM DATA", 46, "from the schematic, not yet confirmed here"},
+    {"Mic PDM CLK", 43, "also the speaker WS line; only one at a time"},
+    {"Mic PDM DATA", 46, "both slots carry the same mono signal"},
 };
 
 static const board_t cardputer = {
@@ -71,8 +80,9 @@ static const board_t cardputer = {
 };
 
 /*
- * Seeed XIAO ESP32-S3 Sense. No speaker at all, so there is no audio preset;
- * its microphone is PDM and waits for the capture side of the audio module.
+ * Seeed XIAO ESP32-S3 Sense. No speaker at all, so there is no audio output
+ * preset -- but its microphone pins are its own, unlike the Cardputer's, so a
+ * capture here does not have to give anything up first.
  */
 static const board_pin_t xiao_pins[] = {
     {"SD CLK", 7, NULL},
@@ -223,6 +233,23 @@ int cmd_board_cardputer_audio(int argc, char **argv)
     return apply(&cardputer, lines, ARRAY_COUNT(lines));
 }
 
+int cmd_board_cardputer_mic(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    /*
+     * The microphone clock is the speaker's word-select line, so this preset
+     * and the audio one are mutually exclusive. `audio pdm` makes that case
+     * itself and names the fix, so nothing is pre-empted here; running the two
+     * in either order gives a clear answer rather than a silent one.
+     */
+    static const char *const lines[] = {
+        "audio pdm 43 46",
+    };
+    return apply(&cardputer, lines, ARRAY_COUNT(lines));
+}
+
 int cmd_board_cardputer_sd(int argc, char **argv)
 {
     (void)argc;
@@ -248,6 +275,17 @@ int cmd_board_xiao_sd(int argc, char **argv)
 
     static const char *const lines[] = {
         "sd spi 7 9 8 21",
+    };
+    return apply(&xiao, lines, ARRAY_COUNT(lines));
+}
+
+int cmd_board_xiao_mic(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    static const char *const lines[] = {
+        "audio pdm 42 41",
     };
     return apply(&xiao, lines, ARRAY_COUNT(lines));
 }
