@@ -122,6 +122,45 @@ need `init ldo 3.0`. This is not the default deliberately: enabling the
 internal regulator on a board that already drives AVDD would put two sources on
 one net.
 
+### `status`
+
+Reads `PU_CTRL`, `CTRL1`, `CTRL2` and the revision register back from the part
+and reports each one as both the raw byte and what its bits mean, followed by
+the tare and scale this session is holding.
+
+Output after `init ldo 3.0` and `gain 128`:
+
+```
+Device revision 0x0F at 0x2A
+PU_CTRL 0xBE  digital up, analog up, ready yes, data ready
+AVDD source: internal LDO
+CTRL1   0x2F  gain x128, LDO 3.0 V
+CTRL2   0x00  10 SPS, calibration ok
+Tare 8421 counts; calibrated
+Scale 214.7 counts per unit
+```
+
+**It does not require `init`, only a bus.** Every line above the tare is read
+out of the chip, so this reports how the part is *actually* configured rather
+than what this firmware believes it did — which is the whole point after the
+ESP has been reset while the NAU7802 kept its power, or when something else set
+the device up. Without `init` in this session the last two lines are replaced
+by a note saying so; the register lines are still true.
+
+That split is worth keeping in mind: the registers live in silicon, while the
+tare offset and scale factor live only in this firmware's memory. A soft reset
+of the ESP loses the calibration while leaving the chip configured and
+converting, and `status` is how you see that state.
+
+During bringup the fields that usually explain a problem are `ready` and
+`data`: `ready no` means the analog section never came up, and `data pending`
+means no conversion has completed, which on a part that is otherwise powered
+points at conversions never having been started. `calibration ERROR` is the
+chip's own `CAL_ERR` bit — the internal offset calibration failed, and every
+reading after it is untrustworthy. `AVDD source` catches the wiring mistake
+`init` is careful about: a board that feeds AVDD from a pin, reported here as
+running from the internal LDO, has two sources on one net.
+
 ### `gain [1..128]` and `rate [10|20|40|80|320]`
 
 Show or set the PGA gain and conversion rate. Both re-run the internal offset
