@@ -4,7 +4,7 @@
 
 Support outputting a simple tone or a frequency sweep over a set time period.
 
-**Implemented** as the `audio` menu — see [README](README.md#audio). Codecs are
+**Implemented** as the `audio` menu — see [docs/audio.md](docs/audio.md). Codecs are
 submenus implementing the `audio_codec_t` vtable in `main/audio/audio.h`; adding
 a part is a new file, a row in the registry in `audio.c`, and a submenu in
 `menu_table.c`.
@@ -35,7 +35,7 @@ Support both mono and stereo setups.
 Sample the microphone for several seconds and report min, max, stdev of the audio data as well as an ASCII frequency plot for simple debugging and to ensure audio data is being received.
 
 **Implemented** as `audio record`, `audio level` and `audio loopback` — see
-[README](README.md#audio). Both slots are always reported separately, so a mono
+[docs/audio.md](docs/audio.md). Both slots are always reported separately, so a mono
 part's slot is discovered rather than assumed. `record` gives min, max, mean,
 stdev, RMS and peak plus a half-octave power spectrum; `loopback` plays a tone
 and measures whether the input hears it, against a silent control.

@@ -46,7 +46,7 @@
  */
 #define BOOT_AP_PASSWORD "bringup1234"
 
-/* README: continuous mode reports every 5 seconds until interrupted. */
+/* docs/wifi.md: continuous mode reports every 5 seconds until interrupted. */
 #define IPERF_CONTINUOUS_INTERVAL_S 5
 #define IPERF_SINGLE_DURATION_S 10
 /* iperf's own time field is uint32; this stands in for "keep going". */
@@ -108,7 +108,7 @@ static const char *disconnect_reason_name(uint8_t reason)
 }
 
 /*
- * The README asks for connection state to be reported "including any
+ * docs/wifi.md asks for connection state to be reported "including any
  * disconnections or changes in the future", so these run for the lifetime of
  * the program rather than only during `connect`.
  */

@@ -54,7 +54,7 @@ int cmd_spi_bus(int argc, char **argv)
     }
 
     /*
-     * CS is an extension to the README syntax. Without it spics_io_num is -1
+     * CS is an extension to the docs/spi.md syntax. Without it spics_io_num is -1
      * and no real peripheral can be selected, so every read returns bus noise.
      */
     int cs = -1;

@@ -46,7 +46,7 @@ typedef struct {
 
 /*
  * M5Stack Cardputer. Every pin here has now been exercised: the SD pins by the
- * benchmark table in the README, the speaker pins by a tone, and the
+ * benchmark table in docs/sd.md, the speaker pins by a tone, and the
  * microphone pins by clocking them from the wrong GPIO and watching the data
  * go completely static -- 48000 consecutive samples of -30935 with the clock
  * elsewhere, real varying audio with it on 43. That is what confirms 43 and 46

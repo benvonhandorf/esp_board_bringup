@@ -170,7 +170,7 @@ int cmd_gpio_read(int argc, char **argv)
             continue;
         }
 
-        /* README sample output: "<pin>: <level>", one pin per row. */
+        /* docs/gpio.md sample output: "<pin>: <level>", one pin per row. */
         bp_printf("%d: %d\n", pin, gpio_get_level(pin));
     }
 

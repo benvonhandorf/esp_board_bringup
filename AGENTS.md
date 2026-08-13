@@ -1,9 +1,10 @@
 # AGENTS.md
 
 Orientation for coding agents. Read this first; it should save you most of a
-codebase scan. `README.md` is the user-facing manual — every command is
-documented there in detail, so consult it instead of reverse-engineering
-behaviour from source.
+codebase scan. `docs/` is the user-facing manual — one page per menu, every
+command documented in detail — so consult `docs/<menu>.md` instead of
+reverse-engineering behaviour from source. `README.md` is the front door: what
+this is, how to build it, and the console conventions that span every menu.
 
 ## What this is
 
@@ -59,6 +60,14 @@ main/
   uart/uart.c         auxiliary UART, separate from the console
   wifi/wifi.c         station + soft AP, iperf; starts the web server once either has an address
   web/                web.c HTTP+WebSocket console, index.html embedded via EMBED_FILES
+
+docs/                 the manual: one page per top-level menu, plus README.md
+                      as the index. A command's docs live in docs/<menu>.md.
+
+tools/                not firmware; see tools/README.md
+  bringup.py          drives the console over serial; exports Console and Checks
+  hosttest/           gcc tests for the audio DSP -- catch what hardware cannot
+  hwtest/             NAU8822 regression tests, run against a real board
 ```
 
 **The subdirectories under `main/` are plain source folders, not ESP-IDF
@@ -88,8 +97,9 @@ and not project-wide.
   `.c`, declare it in the module's `.h`.
 - Add a row to the relevant `bp_command_t[]` in `menu_table.c` (name, usage
   string, one-line help, function).
-- Document it in `README.md` under the matching `####` heading. Commits in this
-  repo change code and README together; keep that.
+- Document it in `docs/<menu>.md` under the matching `##` heading. Commits in
+  this repo change code and docs together; keep that. It is the reason the
+  manual lives in the repo rather than in a GitHub wiki.
 
 ### Conventions to follow
 
@@ -131,7 +141,7 @@ and not project-wide.
   (the NS4168 has no volume control), and returning `ESP_ERR_NOT_SUPPORTED`
   means the driver has already reported the reason, so the caller stays quiet.
   Adding a part: new file, one row in the registry, one submenu in
-  `menu_table.c`, one README section.
+  `menu_table.c`, one section in `docs/audio.md`.
 - **Two codecs attach at once, one per direction**, held in `tx_codec` and
   `rx_codec`. Attaching displaces only parts contending for a direction the
   incoming one needs, and a bidirectional part occupies both. This is a
@@ -196,6 +206,17 @@ and not project-wide.
   hypothetical: on the Cardputer the microphone clock and the speaker's
   word-select are both GPIO 43. `pdm_pins_free()` refuses, because the
   unguarded failure is a plausible silence rather than an error.
+- **`gpio survey` may only infer a pull-up.** Finding two pins with a few
+  kiloohms on them is close to conclusive for I2C. Reading extra picofarads as
+  "something is connected" is not: driven lines look like any other idle input
+  from inside the chip, and a search built on that premise wasted a session on
+  a board whose I2S pins were among the unremarkable-looking ones. The command
+  says so in its own output; do not quietly strengthen the claim.
+- **Guard every rise-time ratio against zero and NaN.** A pin that rises faster
+  than the timer resolves gives `0/0`, and because all comparisons against NaN
+  are false it slips past a `<=` bounds check and comes out the far side as a
+  plausible-looking number. That misreported a real I2C bus as a weak pull-up
+  of "nan k" and broke the conclusion drawn from the whole survey.
 - **Board presets call `bp_menu_execute()` directly**, never
   `bp_console_submit(line, true)` — a preset already runs on the executor task,
   and waiting there for that task to drain its own queue deadlocks.

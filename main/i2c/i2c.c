@@ -147,7 +147,7 @@ int cmd_i2c_bus(int argc, char **argv)
 /*
  * Both I2C lines idle high through their pull-ups. A line stuck low means the
  * bus cannot be driven at all, and every probe would simply time out -- so the
- * README asks for the bus state to be reported instead of an empty table.
+ * docs/i2c.md asks for the bus state to be reported instead of an empty table.
  *
  * Checking costs a brief detour through plain GPIO reads; the bus is restored
  * afterwards by the caller re-creating it.
@@ -238,7 +238,7 @@ int cmd_i2c_scan(int argc, char **argv)
                 bp_printf(" %02x", address);
                 found++;
             } else {
-                /* README: leave the intersection blank when nothing answers. */
+                /* docs/i2c.md: leave the intersection blank when nothing answers. */
                 bp_printf("   ");
             }
         }
