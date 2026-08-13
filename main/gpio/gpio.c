@@ -13,6 +13,8 @@
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
 
+#include <math.h>
+
 #define DEFAULT_BLINK_PERIOD_MS 500
 #define MAX_BLINK_COUNT 1000
 
@@ -818,6 +820,284 @@ static bool calibrate_internal(int argc, char **argv, uint32_t limit, uint32_t c
 
     *r_int = ref_ohms / (ratio - 1.0);
     return true;
+}
+
+/* ------------------------------------------------------------------ */
+/* Survey                                                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * What a pin looks like from the inside, before anything is known about the
+ * board. `rc` measures one pin and prints numbers; this asks the same question
+ * of every pin at once and says what the numbers mean.
+ *
+ * The one inference that holds is the pull-up. An I2C bus is the only thing
+ * that routinely puts a few kiloohms on a pair of pins, so finding exactly two
+ * of them is close to conclusive, and it is worth having because it is the
+ * first thing you want to know about an unfamiliar board.
+ *
+ * The inference that does *not* hold is capacitance. It is tempting to read a
+ * few extra picofarads as "something is connected here", and on a real board
+ * it does not survive contact: a survey of one carrier put its I2S lines among
+ * the pins that looked unremarkable, and a search built on the pins that
+ * looked promising found nothing. Capacitance is reported because it separates
+ * a bare pad from a routed net, and for no stronger purpose than that.
+ */
+typedef enum {
+    NET_SKIPPED,     /* not ours to drive */
+    NET_DRIVEN,      /* something is holding it down */
+    NET_BUS,         /* a pull-up strong enough to be deliberate */
+    NET_WEAK,        /* a pull-up, but not a bus-strength one */
+    NET_FLOATING,    /* nothing pulling it up at all */
+} net_kind_t;
+
+/* Below this a pull-up was fitted on purpose. Above it, leakage or a very
+ * weak part; the usual I2C values -- 2.2k, 4.7k, 10k -- sit well under. */
+#define BUS_PULLUP_MAX_OHMS 15000.0
+
+typedef struct {
+    int pin;
+    net_kind_t kind;
+    double ohms;        /* 0 when unresolvably strong */
+    double farads;
+    const char *why;    /* NET_SKIPPED only */
+} net_t;
+
+static const char *kind_word(const net_t *n)
+{
+    switch (n->kind) {
+    case NET_DRIVEN:   return "driven low";
+    case NET_BUS:      return "pull-up";
+    case NET_WEAK:     return "weak pull-up";
+    case NET_FLOATING: return "floating";
+    default:           return "skipped";
+    }
+}
+
+static void classify(net_t *n, const rc_result_t *r, uint32_t cpu_hz, double r_int)
+{
+    n->farads = -1.0;   /* negative means "not resolved", not "zero" */
+
+    if (r->par == UINT32_MAX) {
+        /* Never rose even with help: either something is holding it, or the
+         * net is enormous. Both mean "not an idle input". */
+        n->kind = NET_DRIVEN;
+        return;
+    }
+
+    /*
+     * No external pull-up at all. This has to be tested before any conclusion
+     * is drawn from a fast rise, because a bare pad with almost no capacitance
+     * also rises immediately -- and reading that as a strong pull-up would put
+     * every unconnected pin in the bus column.
+     */
+    if (r->ext == UINT32_MAX) {
+        n->kind = NET_FLOATING;
+        if (r->par > 0) {
+            n->farads = (double)r->par / cpu_hz / RC_THRESHOLD_TAUS / r_int;
+        }
+        return;
+    }
+
+    /*
+     * A rise the timer cannot resolve, with an external pull-up present.
+     *
+     * The internal pull-up alone takes about 150 ns even on a bare pad, so a
+     * time of zero means something far stronger is doing the work. Both ends
+     * are guarded: a zero denominator here used to produce a NaN ratio, and
+     * because every comparison against NaN is false it fell through to the
+     * arithmetic below and reported a real I2C bus as a weak pull-up of "nan
+     * k" -- which then broke the conclusion drawn from the whole survey.
+     */
+    if (r->ext == 0 || r->par == 0) {
+        n->kind = NET_BUS;
+        n->ohms = 0.0;
+        return;
+    }
+
+    const double t_ext = (double)r->ext / cpu_hz;
+    const double t_par = (double)r->par / cpu_hz;
+    const double ratio = t_ext / t_par;
+    if (!isfinite(ratio) || ratio <= 1.05) {
+        n->kind = NET_BUS;
+        n->ohms = 0.0;
+        return;
+    }
+
+    n->ohms = r_int * (ratio - 1.0);
+    if (!isfinite(n->ohms) || n->ohms <= 0.0) {
+        n->kind = NET_BUS;
+        n->ohms = 0.0;
+        return;
+    }
+    n->farads = t_ext / RC_THRESHOLD_TAUS / n->ohms;
+    n->kind = (n->ohms <= BUS_PULLUP_MAX_OHMS) ? NET_BUS : NET_WEAK;
+}
+
+int cmd_gpio_survey(int argc, char **argv)
+{
+    int *pins = NULL;
+    int count = 0;
+
+    if (argc > 1) {
+        if (parse_pin_list(argv[1], &pins, &count) < 0) {
+            bp_error("Invalid pin specification: %s", argv[1]);
+            return -1;
+        }
+    } else {
+        /* Every pin the chip has. The unsafe ones are filtered below rather
+         * than here, so the report can say which were left out and why. */
+        pins = calloc(SOC_GPIO_PIN_COUNT, sizeof(int));
+        if (!pins) {
+            bp_error("Out of memory");
+            return -1;
+        }
+        for (int pin = 0; pin < SOC_GPIO_PIN_COUNT; pin++) {
+            if (GPIO_IS_VALID_GPIO(pin)) {
+                pins[count++] = pin;
+            }
+        }
+    }
+
+    net_t *nets = calloc((size_t)count, sizeof(net_t));
+    if (!nets) {
+        free(pins);
+        bp_error("Out of memory");
+        return -1;
+    }
+
+    const uint32_t cpu_hz = (uint32_t)esp_clk_cpu_freq();
+    const uint32_t limit = (uint32_t)((uint64_t)RC_TIMEOUT_US * cpu_hz / 1000000);
+    const double r_int = RC_R_INTERNAL;
+
+    bp_printf("Surveying %d pins. Nothing else may be driving them.\n\n", count);
+
+    for (int i = 0; i < count; i++) {
+        nets[i].pin = pins[i];
+
+        if (!GPIO_IS_VALID_GPIO(pins[i])) {
+            nets[i].kind = NET_SKIPPED;
+            nets[i].why = "does not exist on this chip";
+            continue;
+        }
+        if (!pin_is_drivable(pins[i], &nets[i].why)) {
+            nets[i].kind = NET_SKIPPED;
+            continue;
+        }
+
+        const rc_result_t r = measure_pin(pins[i], limit);
+        classify(&nets[i], &r, cpu_hz, r_int);
+    }
+    free(pins);
+
+    /* ---------------- the table ---------------- */
+
+    bp_printf(" pin  %-14s %10s %10s\n", "state", "pull-up", "net C");
+    for (int i = 0; i < count; i++) {
+        const net_t *n = &nets[i];
+        bp_printf("%4d  %-14s ", n->pin, kind_word(n));
+
+        switch (n->kind) {
+        case NET_SKIPPED:
+            bp_printf("%s\n", n->why ? n->why : "");
+            continue;
+        case NET_DRIVEN:
+            bp_printf("%10s %10s  something is holding this pin\n", "--", "--");
+            continue;
+        case NET_FLOATING:
+            bp_printf("%10s ", "none");
+            if (n->farads < 0.0) {
+                bp_printf("%10s  rises too fast to time\n", "--");
+            } else {
+                print_farads(n->farads);
+                bp_printf("\n");
+            }
+            continue;
+        default:
+            break;
+        }
+
+        if (n->ohms == 0.0) {
+            print_ohms(r_int / 20.0);
+            bp_printf("> %10s  too strong to measure\n", "--");
+        } else {
+            print_ohms(n->ohms);
+            bp_printf("  ");
+            if (n->farads < 0.0) {
+                bp_printf("%10s", "--");
+            } else {
+                print_farads(n->farads);
+            }
+            bp_printf("\n");
+        }
+    }
+
+    /* ---------------- what it means ---------------- */
+
+    int bus_pins[8];
+    int bus_count = 0;
+    int driven_count = 0;
+    int skipped_count = 0;
+
+    for (int i = 0; i < count; i++) {
+        if (nets[i].kind == NET_BUS && bus_count < 8) {
+            bus_pins[bus_count++] = nets[i].pin;
+        } else if (nets[i].kind == NET_DRIVEN) {
+            driven_count++;
+        } else if (nets[i].kind == NET_SKIPPED) {
+            skipped_count++;
+        }
+    }
+
+    bp_printf("\n");
+
+    if (bus_count == 2) {
+        /* The strong case. Which pin is which is not observable from here, so
+         * both orders are offered; only one will find anything. */
+        bp_printf("GPIO %d and %d are the only pins with a deliberate pull-up, "
+                  "which is what an I2C bus looks like. Try:\n",
+                  bus_pins[0], bus_pins[1]);
+        bp_printf("    i2c bus %d %d   (then 'i2c scan')\n",
+                  bus_pins[0], bus_pins[1]);
+        bp_printf("    i2c bus %d %d   (SCL and SDA the other way round)\n",
+                  bus_pins[1], bus_pins[0]);
+    } else if (bus_count > 2) {
+        bp_printf("Pins with a deliberate pull-up:");
+        for (int i = 0; i < bus_count; i++) {
+            bp_printf(" %d", bus_pins[i]);
+        }
+        bp_printf("\nMore than a pair, so this may be several buses, or a "
+                  "reset or interrupt line. 'i2c scan' each likely pair.\n");
+    } else if (bus_count == 1) {
+        bp_printf("GPIO %d has a pull-up but nothing else does, so it is more "
+                  "likely a reset, interrupt or enable line than a bus.\n",
+                  bus_pins[0]);
+    } else {
+        bp_printf("No pin carries a bus-strength pull-up, so there is probably "
+                  "no I2C device wired to this board.\n");
+    }
+
+    if (driven_count) {
+        bp_printf("%d pin%s held low. That is a part driving its output, so it "
+                  "is worth identifying before assuming a pin is free.\n",
+                  driven_count, driven_count == 1 ? " is" : "s are");
+    }
+    if (skipped_count) {
+        bp_printf("%d pin%s skipped as unsafe to drive; the reason is on each "
+                  "row.\n", skipped_count, skipped_count == 1 ? " was" : "s were");
+    }
+
+    /*
+     * Said plainly because the temptation is real and the cost of yielding to
+     * it was a wasted search on a board where the answer was in front of me.
+     */
+    bp_printf("\nCapacitance separates a bare pad from a routed net and does "
+              "nothing more. It will not tell you which pins carry a clock or "
+              "data: those are driven, not pulled, and look like any other "
+              "idle input from in here. For those, read the schematic.\n");
+
+    free(nets);
+    return 0;
 }
 
 int cmd_gpio_rc(int argc, char **argv)

@@ -43,6 +43,7 @@ static const bp_command_t gpio_commands[] = {
     {"blink", "<pin> <count> [ms]", "Blink pin(s) for visual identification", cmd_gpio_blink},
     {"short", "<pin>", "Find pins shorted together, adjacent pairs first", cmd_gpio_short},
     {"rc", "<pin> [ref <pin> <kohms>]", "Measure each net's pull-up strength and capacitance", cmd_gpio_rc},
+    {"survey", "[pin]", "Census every pin: pull-ups, driven lines, and what they suggest", cmd_gpio_survey},
 };
 
 static const bp_command_t pwm_commands[] = {

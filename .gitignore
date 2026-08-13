@@ -23,6 +23,9 @@ build/
 *.a
 *.out
 *.exe # For any host-side utilities compiled on Windows
+# Host-side test binaries built by tools/hosttest/Makefile
+/tools/hosttest/tonetest
+/tools/hosttest/capturetest
 
 # ESP-IDF specific build outputs
 *.bin

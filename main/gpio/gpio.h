@@ -7,5 +7,6 @@ int cmd_gpio_aread(int argc, char** argv);
 int cmd_gpio_blink(int argc, char** argv);
 int cmd_gpio_short(int argc, char** argv);
 int cmd_gpio_rc(int argc, char** argv);
+int cmd_gpio_survey(int argc, char** argv);
 
 #endif
