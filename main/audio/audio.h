@@ -99,10 +99,23 @@ typedef struct audio_codec {
     void (*detach)(void);                  /* release pins, power down */
 } audio_codec_t;
 
-/* Make this part the target of the generic commands. Replaces any previous. */
+/*
+ * Make this part the target of the generic commands.
+ *
+ * There are two slots, one per direction, because a board can perfectly well
+ * have an amplifier and a microphone on the same bus and testing one against
+ * the other is the point of `audio loopback`. Attaching only displaces parts
+ * that need a direction the incoming one needs; a part that works both ways,
+ * like the NAU8822, occupies both slots on its own.
+ *
+ * A single slot would be actively wrong rather than merely limiting: detach()
+ * powers a part down -- the NS4168's drives its enable pin low -- so attaching
+ * a microphone would silently stop the amplifier.
+ */
 void audio_codec_attach(const audio_codec_t *codec);
 void audio_codec_detach(void);
-const audio_codec_t *audio_codec_active(void);
+const audio_codec_t *audio_codec_output(void);
+const audio_codec_t *audio_codec_input(void);
 
 /* ------------------------------------------------------------------ */
 /* Transport (i2s_bus.c)                                               */

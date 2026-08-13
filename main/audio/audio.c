@@ -16,6 +16,7 @@
 #include "audio.h"
 #include "codec_nau8822.h"
 #include "codec_ns4168.h"
+#include "codec_sph0645.h"
 
 #include "driver/gpio.h"
 
@@ -36,37 +37,75 @@
 static const audio_codec_t *const codec_registry[] = {
     &nau8822_codec,
     &ns4168_codec,
+    &sph0645_codec,
 };
 #define CODEC_COUNT (sizeof(codec_registry) / sizeof(codec_registry[0]))
 
-static const audio_codec_t *active_codec;
+/* One slot per direction; see audio_codec_attach() in audio.h for why. */
+static const audio_codec_t *tx_codec;
+static const audio_codec_t *rx_codec;
 static int last_volume_pct = -1;
 
 /* ------------------------------------------------------------------ */
 /* Codec attachment                                                    */
 /* ------------------------------------------------------------------ */
 
+static void release(const audio_codec_t *codec)
+{
+    if (!codec) {
+        return;
+    }
+    if (codec->detach) {
+        codec->detach();
+    }
+    /* Clear both slots: a bidirectional part holds two and must not be left
+     * half-attached, pointing at hardware it has just powered down. */
+    if (tx_codec == codec) {
+        tx_codec = NULL;
+    }
+    if (rx_codec == codec) {
+        rx_codec = NULL;
+    }
+}
+
 void audio_codec_attach(const audio_codec_t *codec)
 {
-    if (active_codec && active_codec != codec && active_codec->detach) {
-        active_codec->detach();
+    if (!codec) {
+        return;
     }
-    active_codec = codec;
+
+    /* Displace only what contends for a direction this part needs. */
+    if ((codec->directions & AUDIO_DIR_TX) && tx_codec != codec) {
+        release(tx_codec);
+    }
+    if ((codec->directions & AUDIO_DIR_RX) && rx_codec != codec) {
+        release(rx_codec);
+    }
+
+    if (codec->directions & AUDIO_DIR_TX) {
+        tx_codec = codec;
+    }
+    if (codec->directions & AUDIO_DIR_RX) {
+        rx_codec = codec;
+    }
     last_volume_pct = -1;
 }
 
 void audio_codec_detach(void)
 {
-    if (active_codec && active_codec->detach) {
-        active_codec->detach();
-    }
-    active_codec = NULL;
+    release(tx_codec);
+    release(rx_codec);
     last_volume_pct = -1;
 }
 
-const audio_codec_t *audio_codec_active(void)
+const audio_codec_t *audio_codec_output(void)
 {
-    return active_codec;
+    return tx_codec;
+}
+
+const audio_codec_t *audio_codec_input(void)
+{
+    return rx_codec;
 }
 
 /* ------------------------------------------------------------------ */
@@ -338,14 +377,23 @@ int cmd_audio_bus(int argc, char **argv)
     }
 
     /* An attached part was configured for the old format; bring it in line. */
-    if (active_codec && active_codec->configure) {
-        err = active_codec->configure(audio_bus_format());
+    const audio_codec_t *attached[] = {tx_codec, rx_codec};
+    for (size_t i = 0; i < 2; i++) {
+        const audio_codec_t *codec = attached[i];
+        /* A part holding both slots appears twice; configure it once. */
+        if (!codec || !codec->configure || (i == 1 && codec == attached[0])) {
+            continue;
+        }
+        err = codec->configure(audio_bus_format());
+        if (err == ESP_ERR_NOT_SUPPORTED) {
+            return -1;   /* the driver has already explained */
+        }
         if (err != ESP_OK) {
-            bp_error("Reconfiguring %s for the new format: %s",
-                     active_codec->name, esp_err_to_name(err));
+            bp_error("Reconfiguring %s for the new format: %s", codec->name,
+                     esp_err_to_name(err));
             return -1;
         }
-        bp_printf("Reconfigured %s for the new format.\n", active_codec->name);
+        bp_printf("Reconfigured %s for the new format.\n", codec->name);
     }
 
     return 0;
@@ -381,18 +429,32 @@ int cmd_audio_info(int argc, char **argv)
 
     print_input();
 
-    if (!active_codec) {
-        bp_printf("Codec:   none attached (a bare I2S DAC or amplifier needs "
-                  "none)\n");
+    if (!tx_codec && !rx_codec) {
+        bp_printf("Codec:   none attached (a bare I2S DAC, amplifier or "
+                  "microphone needs none)\n");
         return 0;
     }
 
-    bp_printf("Codec:   %s - %s\n", active_codec->name, active_codec->description);
-    if (last_volume_pct >= 0) {
-        bp_printf("Volume:  %d%%\n", last_volume_pct);
-    }
-    if (active_codec->status) {
-        active_codec->status();
+    const audio_codec_t *attached[] = {tx_codec, rx_codec};
+    const char *role[] = {"Plays", "Records"};
+    for (size_t i = 0; i < 2; i++) {
+        const audio_codec_t *codec = attached[i];
+        if (!codec) {
+            continue;
+        }
+        if (i == 1 && codec == attached[0]) {
+            continue;   /* one part holding both slots; already listed */
+        }
+
+        const char *label = (codec->directions == (AUDIO_DIR_TX | AUDIO_DIR_RX))
+                            ? "Codec" : role[i];
+        bp_printf("%-8s %s - %s\n", label, codec->name, codec->description);
+        if (i == 0 && last_volume_pct >= 0) {
+            bp_printf("Volume:  %d%%\n", last_volume_pct);
+        }
+        if (codec->status) {
+            codec->status();
+        }
     }
     return 0;
 }
@@ -409,7 +471,7 @@ int cmd_audio_codecs(int argc, char **argv)
                         : (c->directions & AUDIO_DIR_RX) ? "in" : "out";
         bp_printf("%-10s %-7s %-5s %s%s\n", c->name, dir,
                   c->needs_mclk ? "yes" : "no", c->description,
-                  c == active_codec ? "  <- attached" : "");
+                  (c == tx_codec || c == rx_codec) ? "  <- attached" : "");
     }
     return 0;
 }
@@ -1028,15 +1090,21 @@ int cmd_audio_loopback(int argc, char **argv)
 /* Generic codec operations                                            */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Volume and mute are output ideas first, so the output part answers for them
+ * when there is one, and an input-only part gets the question otherwise -- a
+ * codec with a microphone preamp may well have a gain worth setting.
+ */
 static const audio_codec_t *require_codec(const char *operation)
 {
-    if (!active_codec) {
+    const audio_codec_t *codec = tx_codec ? tx_codec : rx_codec;
+    if (!codec) {
         bp_error("No codec attached, so there is nothing to %s", operation);
         bp_printf("Run 'audio codecs' for the parts this firmware knows, then "
                   "attach one (for example 'audio nau8822 init').\n");
         return NULL;
     }
-    return active_codec;
+    return codec;
 }
 
 int cmd_audio_volume(int argc, char **argv)
@@ -1138,10 +1206,13 @@ int cmd_audio_close(int argc, char **argv)
      * thumps the speaker, and a codec left powered on a dead bus is the kind
      * of state that makes the next bring-up attempt confusing.
      */
-    if (active_codec) {
-        bp_printf("Detaching %s\n", active_codec->name);
-        audio_codec_detach();
+    if (tx_codec) {
+        bp_printf("Detaching %s\n", tx_codec->name);
     }
+    if (rx_codec && rx_codec != tx_codec) {
+        bp_printf("Detaching %s\n", rx_codec->name);
+    }
+    audio_codec_detach();
 
     bool had_rx = audio_bus_rx_ready();
     if (!audio_bus_ready() && !had_rx) {

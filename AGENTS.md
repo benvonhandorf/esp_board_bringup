@@ -50,7 +50,7 @@ main/
   audio/              i2s_bus.c (transport), tone.c (signal generation),
                       capture.c (input statistics, FFT, tone detection),
                       audio.c (the menu + codec registry),
-                      codec_nau8822.c, codec_ns4168.c
+                      codec_nau8822.c, codec_ns4168.c, codec_sph0645.c
   board/              board.c named pinouts and per-subsystem setup presets
   gpio/               gpio.c (set/read/aread/blink/short/rc), pwm.c (LEDC)
   i2c/                i2c.c (bus/scan/read) + drivers: ina237.c, sht4x.c, nau7802.c
@@ -132,6 +132,20 @@ and not project-wide.
   means the driver has already reported the reason, so the caller stays quiet.
   Adding a part: new file, one row in the registry, one submenu in
   `menu_table.c`, one README section.
+- **Two codecs attach at once, one per direction**, held in `tx_codec` and
+  `rx_codec`. Attaching displaces only parts contending for a direction the
+  incoming one needs, and a bidirectional part occupies both. This is a
+  correctness requirement, not a convenience: `detach()` powers a part down —
+  the NS4168's drives its enable pin low — so a single slot would make
+  attaching a microphone silently stop the amplifier. Anything iterating the
+  two slots must skip the duplicate when one part holds both.
+- **A part with no control bus can still deserve a driver.** The test is not
+  "has registers" but "can it fail silently": the NS4168 has an enable pin and
+  a channel-select quirk, and the SPH0645 has a fixed oversampling ratio, a
+  clock range outside which it sleeps, and a SELECT strap. Each of those
+  produces plausible-looking data rather than an error, which is exactly what a
+  bringup tool should catch. A part with no such traps — a PDM microphone, an
+  INMP441 — needs no driver and should not get one.
 - **`audio nau8822` spans two menus.** Control is I2C and audio is I2S, so it
   needs `i2c bus` *and* `audio bus` up first, and `audio bus` must have been
   given an `mclk` pin. Each check names the fix, because the dependency is not

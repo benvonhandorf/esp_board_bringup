@@ -41,7 +41,19 @@ Requires a hardware PDM-to-PCM filter, which the ESP32-C3 lacks.
 
 e.g. Knowles SPH0645LM4H-B I2S Microphone
 
-Implemented: `audio bus <bclk> <ws> <dout> din <pin> bits 32`. Also driverless.
+Implemented: `audio bus <bclk> <ws> <dout> din <pin> bits 32` receives from any
+of them, and `audio sph0645` adds the Knowles part's own constraints — a fixed
+oversampling ratio of 64 that forces 32-bit slots, a 2.048–4.096 MHz clock
+limit that forces a 32–64 kHz sample rate, and a SELECT strap that decides
+which slot it lands in. Each of those fails silently rather than loudly, which
+is what earns the part a driver despite having no control bus.
+
+Untested against real hardware; there is no SPH0645 on the bench. The 32-bit
+capture path and every refusal have been exercised on the Cardputer through the
+internal loopback.
+
+Other 24/32-bit I2S microphones (INMP441, ICS-43434) work through the bus
+command and `audio record` without a submenu.
 
 ### Loopback
 

@@ -824,8 +824,16 @@ the way `sd` owns whichever bus a card is on. The generic commands here never
 mention a specific part: they work through a small codec interface, so a
 NAU8822 with sixty registers and an NS4168 with one enable pin are driven by
 the same `audio tone`, `audio volume` and `audio mute`. Parts appear as
-submenus (`audio nau8822`, `audio ns4168`) and attach themselves when
-initialized.
+submenus (`audio nau8822`, `audio ns4168`, `audio sph0645`) and attach
+themselves when initialized.
+
+**Two parts can be attached at once, one per direction.** A board may well have
+an amplifier and a microphone on the same bus, and testing one against the
+other is the whole point of `audio loopback`. Attaching a part only displaces
+one that needs the same direction; a part that works both ways, like the
+NAU8822, occupies both slots on its own. A single slot would be worse than
+limiting — detaching powers a part down, so attaching a microphone would
+silently stop the amplifier.
 
 **The wire is always two slots wide.** I2S has a genuine mono slot mode, but a
 stereo part fed one-slot frames plays everything an octave down at half speed,
@@ -845,8 +853,8 @@ as a multiple of the sample rate; it defaults to 256, or 384 at 24 bits, which
 the driver requires to be a multiple of 3 for the rate to come out accurate.
 
 `din` adds a receiver sharing the same BCLK and WS — an I2S microphone such as
-the SPH0645, or a codec's ADC. A PDM microphone is a different mode and has its
-own command, `audio pdm`.
+the SPH0645 (which has a submenu of its own, below), or a codec's ADC. A PDM
+microphone is a different mode and has its own command, `audio pdm`.
 
 **Setting `din` to the same pin as `dout` is an internal loopback.** The I2S
 driver notices and feeds the transmitter straight back to the receiver through
@@ -1124,6 +1132,52 @@ a left-only tone is silent there, and that is the board, not a fault.
 Shows the enable pin and its state. It also says outright that nothing here
 confirms the part really is an NS4168 — with no control bus, there is no way to
 ask.
+
+#### SPH0645
+
+Reached as `audio sph0645 ...`. The Knowles SPH0645LM4H-B I2S MEMS microphone,
+and the input-side counterpart to the NS4168: also no control bus, also no
+registers. So why does it get a driver at all, when `audio bus ... din <pin>`
+already receives I2S?
+
+Because the datasheet imposes three constraints that are invisible from the
+command line and that fail *quietly* rather than loudly:
+
+- **The oversampling ratio is fixed at 64**, so WS must be BCLK/64. Two 32-bit
+  slots give exactly that. Ask for 16-bit slots and the frame is 32 clocks, the
+  part sees word-select at twice the rate it expects, and what comes back is
+  not silence but plausible-looking rubbish.
+- **The clock must be 2.048–4.096 MHz**, which at 64 clocks per frame means a
+  sample rate of 32–64 kHz and nothing else. Below 900 kHz the part
+  deliberately sleeps and tri-states its data pin, which reads as a dead
+  microphone rather than as a misconfiguration.
+- **SELECT decides which slot it lands in** — low drives the line while
+  word-select is low, which in I2S is the left slot. It is usually strapped on
+  the board, so the software cannot read it and has to be told.
+
+`init [left|right] [sel <pin>]` checks the first two against the live bus and
+records the third. Give `sel` a GPIO and it drives it, which turns "which slot
+is my microphone in" from a question into an experiment you can run twice.
+
+`status` reports the slot, the measured bit clock against the datasheet range,
+and what the part guarantees: 24-bit words with 18 bits of real precision and
+the low bits always zero — worth stating, because it means zeros down there are
+the part working to specification rather than something truncating in this
+firmware. It also gives the sensitivity (94 dB SPL reads −26 dBFS) so there is
+something to compare a recording against, and notes that a single microphone on
+a bus needs a 100 kΩ pull-down on the data line: without it, the half of the
+frame the part tri-states floats to whatever the bus capacitance holds, and the
+other slot mirrors the first instead of reading silence.
+
+**Not verified against a real part.** There is no SPH0645 on the bench, so this
+is transcribed from the Rev B datasheet. The 32-bit capture path it depends on
+*has* been exercised on hardware through the internal loopback, and so have all
+of its refusals; the part itself has not.
+
+Other 24/32-bit I2S microphones — the INMP441, the ICS-43434 — work through the
+same `audio bus ... din <pin> bits 32` and the same `audio record`, without
+this submenu. They differ in their clock limits, so the checks here are the
+SPH0645's rather than universal.
 
 ### Board
 

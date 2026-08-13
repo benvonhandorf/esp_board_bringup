@@ -8,6 +8,7 @@
 #include "board.h"
 #include "codec_nau8822.h"
 #include "codec_ns4168.h"
+#include "codec_sph0645.h"
 #include "gpio.h"
 #include "pwm.h"
 #include "i2c.h"
@@ -221,7 +222,20 @@ static const bp_command_t audio_commands[] = {
     {"close", "", "Detach the codec and release I2S", cmd_audio_close},
 };
 
-static const bp_menu_t *const audio_submenus[] = {&nau8822_menu, &ns4168_menu};
+static const bp_command_t sph0645_commands[] = {
+    {"init", "[left|right] [sel <pin>]", "Attach the microphone and check the bus suits it", cmd_sph0645_init},
+    {"status", "", "Show the slot, clock and what the part guarantees", cmd_sph0645_status},
+};
+
+static const bp_menu_t sph0645_menu = {
+    .name = "sph0645",
+    .help = "Knowles SPH0645LM4H-B I2S MEMS microphone (no control bus)",
+    .commands = sph0645_commands,
+    .command_count = ARRAY_COUNT(sph0645_commands),
+};
+
+static const bp_menu_t *const audio_submenus[] = {&nau8822_menu, &ns4168_menu,
+                                                  &sph0645_menu};
 
 static const bp_menu_t audio_menu = {
     .name = "audio",

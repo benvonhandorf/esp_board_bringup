@@ -18,6 +18,7 @@ idf_component_register(
         "audio/capture.c"
         "audio/codec_nau8822.c"
         "audio/codec_ns4168.c"
+        "audio/codec_sph0645.c"
         "board/board.c"
         "gpio/gpio.c"
         "gpio/pwm.c"
