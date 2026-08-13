@@ -150,6 +150,16 @@ and not project-wide.
   needs `i2c bus` *and* `audio bus` up first, and `audio bus` must have been
   given an `mclk` pin. Each check names the fix, because the dependency is not
   visible from the command being typed.
+- **The NAU8822's power-management registers span both directions.** The
+  headphone drivers share Power Management 2 with the ADC and its front end, so
+  `apply_power()` recomputes the whole word from the whole of the driver's
+  state. Writing only the output bits — as the routing code originally did —
+  silently powered the capture chain back down on every route change. Never
+  write one of these registers from a function that knows about one direction.
+- **The NAU8822's ADC starts off, on purpose.** Microphone and line inputs take
+  different paths, different gain registers and different bias, and which is
+  fitted is a board fact. Guessing wrong puts mic bias on a line output or
+  20 dB of gain into a clip, so `input` demands the choice.
 - **`audio bus` leaves the transmitter running**, sending silence. Codecs mute
   or reset when their clocks stop, and cycling the clock around every tone pops
   an amplifier. Do not "optimise" this into enabling TX only while playing.

@@ -1063,7 +1063,12 @@ enabled when its clocks stop thumps the speaker.
 #### NAU8822
 
 Reached as `audio nau8822 ...`. Drives the Nuvoton NAU8822 stereo codec with
-speaker driver. Control is I2C at `0x1a` (CSB low) or `0x1b` (CSB high), so
+speaker driver — the only part here that both plays and records, and so the
+only one that can run `audio loopback` through real air rather than through the
+chip's internal loopback. Its speaker driver and its ADC are on the same I2S
+bus with no shared pin, which the Cardputer's microphone and speaker are not.
+
+Control is I2C at `0x1a` (CSB low) or `0x1b` (CSB high), so
 **the `i2c` menu's bus must be up first** — run `i2c bus <scl> <sda>` before
 `audio nau8822 init`. Audio arrives over I2S, so `audio bus` must be up too,
 and it must have an `mclk` pin: the part is a slave and has no way to make a
@@ -1090,10 +1095,62 @@ to full scale, routes only the DAC into the output mixers — so a tone that
 comes out came from I2S and nowhere else — enables thermal shutdown on the
 speaker driver, and brings up both outputs.
 
+The capture side comes up configured but **unpowered and disconnected**. See
+`input` below for why that is not an oversight.
+
 Volume is carried by the analog output attenuator, not the digital DAC volume:
 attenuating digitally throws away bits, and the question on a bench is usually
 whether the analog path works at all. 100 % is 0 dB; the six steps of gain
 above that are deliberately not reachable.
+
+##### `input <mic|line|off> [boost]` and `gain [db]`
+
+The capture side. This is the one part here that records *and* plays, so it
+occupies both codec slots on its own and `audio record` works through it once
+an input is selected.
+
+**`init` deliberately leaves the ADC off.** The part has two input paths and
+they are not interchangeable — a microphone goes in differentially on
+MICP/MICN through the input mixer and the PGA, wanting mic bias and usually the
++20 dB boost; a line signal goes in on L2/R2 straight to the boost mixer,
+skipping the PGA, wanting neither. Which is fitted is a board fact the driver
+cannot read, and guessing wrong is not harmless: mic bias on a line output is
+pointless at best, and 20 dB of gain on one clips instantly. So it waits to be
+told.
+
+`gain` follows whichever path is selected, because they are different
+amplifiers with different ranges: the microphone PGA covers −12 to +35.25 dB in
+0.75 dB steps, and the line input −15 to +3 dB in steps of 3. Both quantise, so
+the value reported back is the one actually programmed rather than the one
+asked for. `boost` is the separate +20 dB stage ahead of the ADC and only
+exists on the microphone path — asking for it on the line input is refused
+rather than ignored, since silently dropping it would leave you believing in
+gain that is not there.
+
+The ADC's high-pass filter is left on. An electret or MEMS input carries a DC
+offset that is not signal, and the part can remove it in hardware — which is
+the same problem `audio record` works around in software by quoting RMS about
+the mean.
+
+Selecting an input warns if the I2S bus has no receive line, because the ADC
+then has nowhere to send samples and `audio record` would report a dead input
+on a codec that is working perfectly. The full setup is `audio bus <bclk> <ws>
+<dout> din <pin> mclk <pin>`, with `din` on the codec's ADCOUT.
+
+**How this was verified without a microphone.** With nothing connected to the
+inputs the ADC still sees its own front-end noise, and if the PGA is genuinely
+in circuit then raising its gain has to raise that noise by the same number of
+decibels. It does: over the PGA's full 47.25 dB the measured floor rose 48.0 dB,
+and the +20 dB boost stage added 19.5 dB. At the bottom of the range the rise
+lags slightly — 5.0 dB for a commanded 6 — which is the converter's own floor
+showing through underneath, exactly as it should. The control is the same one
+that confirmed the Cardputer's microphone: powered down, the ADC returns not a
+small number but *exactly* zero.
+
+The line path can only be half-checked this way. Its gain sits after the point
+where the ADC's noise enters, so with no source connected the floor barely
+moves; the registers demonstrably take effect, but the dB scale needs a real
+signal to confirm.
 
 ##### `status`, `reg <n> [value]`, `route <hp|speaker|both>`
 

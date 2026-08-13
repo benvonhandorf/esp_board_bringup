@@ -12,7 +12,18 @@ a part is a new file, a row in the registry in `audio.c`, and a submenu in
 ### NAU8822
 
 Implemented: `audio nau8822`. Control over I2C at 0x1a/0x1b, audio over I2S,
-requires MCLK.
+requires MCLK. Both directions: playback through the DAC and speaker driver,
+capture through the ADC via `audio nau8822 input <mic|line|off>` with analog
+gain on `audio nau8822 gain`. The only part here that does both, and therefore
+the only one that can run `audio loopback` acoustically.
+
+Verified on hardware (2026-08-13) except the DAC and the analog outputs, which
+need a transducer or a loopback jumper to observe. Confirmed: identity and the
+full 64-register map against the mainline reset defaults, the init sequence,
+every input-path register write, format encoding across seven rate/width
+combinations, output volume, mute and routing, and — the part that matters —
+the ADC producing real data whose noise floor tracks the input PGA to within
+0.75 dB over 47 dB of range.
 
 ### NS4168
 

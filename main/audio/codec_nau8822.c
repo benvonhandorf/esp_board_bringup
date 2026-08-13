@@ -19,6 +19,8 @@
 #include "codec_nau8822.h"
 #include "i2c.h"
 
+#include <math.h>
+
 #define NAU8822_ADDR_LOW  0x1a
 #define NAU8822_ADDR_HIGH 0x1b
 
@@ -37,6 +39,14 @@
 #define REG_DAC_CONTROL        0x0a
 #define REG_LEFT_DAC_VOLUME    0x0b
 #define REG_RIGHT_DAC_VOLUME   0x0c
+#define REG_ADC_CONTROL        0x0e
+#define REG_LEFT_ADC_VOLUME    0x0f
+#define REG_RIGHT_ADC_VOLUME   0x10
+#define REG_INPUT_CONTROL      0x2c
+#define REG_LEFT_INPPGA        0x2d
+#define REG_RIGHT_INPPGA       0x2e
+#define REG_LEFT_ADC_BOOST     0x2f
+#define REG_RIGHT_ADC_BOOST    0x30
 #define REG_OUTPUT_CONTROL     0x31
 #define REG_LEFT_MIXER         0x32
 #define REG_RIGHT_MIXER        0x33
@@ -52,10 +62,63 @@
 #define PM1_REFIMP_80K   0x01
 #define PM1_IOBUF_EN     (1 << 2)
 #define PM1_ABIAS_EN     (1 << 3)
+#define PM1_MICBIAS_EN   (1 << 4)
 
-/* Power Management 2 (0x02): headphone drivers at the top of the register */
+/* Power Management 2 (0x02): the capture chain at the bottom of the register,
+ * headphone drivers at the top. Every stage powers up separately, and the
+ * capture path is only as alive as its least-powered stage. */
+#define PM2_ADCL_EN      (1 << 0)
+#define PM2_ADCR_EN      (1 << 1)
+#define PM2_INPGAL_EN    (1 << 2)
+#define PM2_INPGAR_EN    (1 << 3)
+#define PM2_BOOSTL_EN    (1 << 4)
+#define PM2_BOOSTR_EN    (1 << 5)
 #define PM2_LHP_EN       (1 << 7)
 #define PM2_RHP_EN       (1 << 8)
+
+/*
+ * ADC Control (0x0e). Only the high-pass filter is touched.
+ *
+ * Bit 8 enables it and it is on at reset, which is the right default: a MEMS
+ * or electret input carries a DC offset that is not signal, and leaving it in
+ * makes a quiet channel look busy -- exactly the confusion `audio record`
+ * sidesteps by quoting RMS about the mean. The cut-off bits are deliberately
+ * left alone: the mainline Linux driver defines the cut-off as bits 6:4 and
+ * the ADC oversampling switch as bit 5, which cannot both be right, and
+ * nothing here needs either.
+ */
+#define ADC_HPF_EN       (1 << 8)
+
+/* Input Control (0x2c): what reaches each channel's input mixer. */
+#define IN_LMICP         (1 << 0)
+#define IN_LMICN         (1 << 1)
+#define IN_L2            (1 << 2)
+#define IN_RMICP         (1 << 4)
+#define IN_RMICN         (1 << 5)
+#define IN_R2            (1 << 6)
+
+/*
+ * Input PGA (0x2d/0x2e). Six gain bits from -12 dB in 0.75 dB steps, so code
+ * 16 is 0 dB and code 63 is +35.25 dB. Bit 8 latches the pair, as with the
+ * output volumes.
+ */
+#define PGA_MUTE         (1 << 6)
+#define PGA_CODE_MAX     63
+#define PGA_MIN_DB       (-12.0)
+#define PGA_STEP_DB      0.75
+
+/*
+ * ADC Boost (0x2f/0x30). Bit 8 is a fixed +20 dB ahead of the ADC for the
+ * microphone path. Bits 6:4 are the line input's own way into the boost mixer,
+ * bypassing the PGA entirely: code 0 mutes, code 1 is -15 dB, 3 dB a step, so
+ * code 6 is 0 dB and code 7 is +3 dB.
+ */
+#define BOOST_PGA_20DB   (1 << 8)
+#define BOOST_L2_SHIFT   4
+#define BOOST_CODE_MAX   7
+#define BOOST_MIN_DB     (-15.0)
+#define BOOST_STEP_DB    3.0
+#define BOOST_CODE_0DB   6
 
 /* Power Management 3 (0x03) */
 #define PM3_DACL_EN      (1 << 0)
@@ -97,6 +160,25 @@ typedef enum {
     ROUTE_BOTH,
 } route_t;
 
+/*
+ * Which analog input reaches the ADC.
+ *
+ * The part offers two routes and they are not interchangeable. A microphone
+ * goes in differentially on MICP/MICN, through the input mixer and the PGA,
+ * and wants mic bias and usually the +20 dB boost. A line signal goes in on
+ * L2/R2 straight to the boost mixer, skipping the PGA, and wants neither --
+ * bias on a line output is at best pointless and 20 dB of gain on one clips
+ * immediately.
+ *
+ * There is no default worth guessing. Which is fitted is a board fact, so
+ * `init` powers the ADC down and waits to be told.
+ */
+typedef enum {
+    INPUT_OFF,
+    INPUT_MIC,
+    INPUT_LINE,
+} input_t;
+
 static uint8_t address = NAU8822_ADDR_LOW;
 static uint16_t shadow[REG_COUNT];
 static bool initialized;
@@ -104,6 +186,11 @@ static bool readback_works;
 static uint16_t device_id_seen;
 static route_t route = ROUTE_BOTH;
 static int volume_pct = 60;
+
+static input_t input_path = INPUT_OFF;
+static bool input_boost;            /* the +20 dB stage, microphone path only */
+static int pga_code = 16;           /* 0 dB */
+static int line_code = BOOST_CODE_0DB;
 
 /* ------------------------------------------------------------------ */
 /* Register access                                                     */
@@ -309,8 +396,118 @@ static esp_err_t apply_volume(void)
     return ESP_OK;
 }
 
-static esp_err_t apply_route(void)
+/*
+ * Analog gain on the selected input path.
+ *
+ * The two paths take their gain from different registers, so this follows
+ * whichever is selected rather than pretending there is one control. Nothing
+ * is written for INPUT_OFF: the stages are unpowered and the values are
+ * restored when a path is chosen again.
+ */
+static esp_err_t apply_input_gain(void)
 {
+    if (input_path == INPUT_MIC) {
+        uint16_t value = (uint16_t)pga_code;
+        esp_err_t err = write_reg(REG_LEFT_INPPGA, value);
+        if (err != ESP_OK) {
+            return err;
+        }
+        /* Bit 8 latches both channels together, as for the output volumes. */
+        return write_reg(REG_RIGHT_INPPGA, (uint16_t)(value | VOL_UPDATE));
+    }
+
+    if (input_path == INPUT_LINE) {
+        uint16_t value = (uint16_t)(line_code << BOOST_L2_SHIFT);
+        esp_err_t err = write_reg(REG_LEFT_ADC_BOOST, value);
+        if (err != ESP_OK) {
+            return err;
+        }
+        return write_reg(REG_RIGHT_ADC_BOOST, value);
+    }
+
+    return ESP_OK;
+}
+
+/*
+ * Everything from the input pins to the ADC.
+ *
+ * Written as a whole rather than as incremental edits because these registers
+ * pack unrelated fields, and a half-configured analog chain is the kind of
+ * state that produces a plausible signal from the wrong place.
+ */
+static esp_err_t apply_input(void)
+{
+    uint16_t control = 0;
+    uint16_t boost = 0;
+
+    switch (input_path) {
+    case INPUT_MIC:
+        control = IN_LMICP | IN_LMICN | IN_RMICP | IN_RMICN;
+        if (input_boost) {
+            boost = BOOST_PGA_20DB;
+        }
+        break;
+    case INPUT_LINE:
+        /* L2/R2 reach the boost mixer directly; the input mixer stays empty so
+         * the PGA contributes nothing to what the ADC sees. */
+        control = 0;
+        boost = (uint16_t)(line_code << BOOST_L2_SHIFT);
+        break;
+    case INPUT_OFF:
+        break;
+    }
+
+    esp_err_t err = write_reg(REG_INPUT_CONTROL, control);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = write_reg(REG_LEFT_ADC_BOOST, boost);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = write_reg(REG_RIGHT_ADC_BOOST, boost);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* Unmute the PGA only on the path that uses it. */
+    uint16_t pga = (input_path == INPUT_MIC) ? (uint16_t)pga_code
+                                             : (uint16_t)(PGA_MUTE);
+    err = write_reg(REG_LEFT_INPPGA, pga);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = write_reg(REG_RIGHT_INPPGA, (uint16_t)(pga | VOL_UPDATE));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    /* High-pass on, and the digital ADC volume left at full scale for the same
+     * reason the DAC's is: attenuating in the digital domain throws away bits
+     * that the analog gain above should have set correctly instead. */
+    err = write_reg(REG_ADC_CONTROL, ADC_HPF_EN);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = write_reg(REG_LEFT_ADC_VOLUME, 0xff);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return write_reg(REG_RIGHT_ADC_VOLUME, 0xff | VOL_UPDATE);
+}
+
+/*
+ * Power management for both directions at once.
+ *
+ * These bits share registers across the playback and capture chains -- the
+ * headphone drivers sit in the same register as the ADC and its front end --
+ * so the whole word has to be computed from the whole of the driver's state.
+ * Writing the output bits alone, as an earlier version did, silently powered
+ * the capture path back down every time the route changed.
+ */
+static esp_err_t apply_power(void)
+{
+    uint16_t pm1 = PM1_REFIMP_80K | PM1_IOBUF_EN | PM1_ABIAS_EN;
     uint16_t pm2 = 0;
     uint16_t pm3 = PM3_DACL_EN | PM3_DACR_EN | PM3_LMIX_EN | PM3_RMIX_EN;
 
@@ -321,7 +518,21 @@ static esp_err_t apply_route(void)
         pm3 |= PM3_LSPK_EN | PM3_RSPK_EN;
     }
 
-    esp_err_t err = write_reg(REG_POWER_MANAGEMENT_2, pm2);
+    if (input_path != INPUT_OFF) {
+        pm2 |= PM2_ADCL_EN | PM2_ADCR_EN | PM2_BOOSTL_EN | PM2_BOOSTR_EN;
+    }
+    if (input_path == INPUT_MIC) {
+        /* Only the microphone path runs through the input mixer and the PGA,
+         * and only it needs bias for an electret capsule. */
+        pm2 |= PM2_INPGAL_EN | PM2_INPGAR_EN;
+        pm1 |= PM1_MICBIAS_EN;
+    }
+
+    esp_err_t err = write_reg(REG_POWER_MANAGEMENT_1, pm1);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = write_reg(REG_POWER_MANAGEMENT_2, pm2);
     if (err != ESP_OK) {
         return err;
     }
@@ -427,7 +638,7 @@ static void nau8822_detach(void)
 const audio_codec_t nau8822_codec = {
     .name = "nau8822",
     .description = "Nuvoton NAU8822 stereo codec with speaker driver, I2C at 0x1a/0x1b",
-    .directions = AUDIO_DIR_TX,
+    .directions = AUDIO_DIR_TX | AUDIO_DIR_RX,
     .needs_mclk = true,
     .probe = nau8822_probe,
     .configure = nau8822_configure,
@@ -519,8 +730,25 @@ int cmd_nau8822_init(int argc, char **argv)
         return -1;
     }
 
+    /*
+     * The capture chain comes up configured but unpowered and disconnected.
+     * Which input is fitted -- a microphone on MICP/MICN or a line signal on
+     * L2/R2 -- is a board fact this driver cannot read, and guessing wrong is
+     * not harmless: mic bias onto a line output, or the +20 dB boost on one,
+     * clips instantly. `audio nau8822 input` makes the choice explicit.
+     */
+    input_path = INPUT_OFF;
+    input_boost = false;
+    pga_code = 16;
+    line_code = BOOST_CODE_0DB;
+    err = apply_input();
+    if (err != ESP_OK) {
+        bp_error("Configuring the capture path: %s", esp_err_to_name(err));
+        return -1;
+    }
+
     route = ROUTE_BOTH;
-    err = apply_route();
+    err = apply_power();
     if (err != ESP_OK) {
         bp_error("Enabling the outputs: %s", esp_err_to_name(err));
         return -1;
@@ -531,6 +759,8 @@ int cmd_nau8822_init(int argc, char **argv)
 
     bp_printf("NAU8822 initialized at 0x%02x, headphone and speaker outputs "
               "live at %d%%\n", address, volume_pct);
+    bp_printf("The ADC is off. Run 'audio nau8822 input mic' or '... input "
+              "line' to record.\n");
     return 0;
 }
 
@@ -543,10 +773,42 @@ static const char *route_name(void)
     }
 }
 
+static const char *input_name(void)
+{
+    switch (input_path) {
+    case INPUT_MIC:  return input_boost
+                            ? "microphone (MICP/MICN, PGA, +20 dB boost)"
+                            : "microphone (MICP/MICN, through the PGA)";
+    case INPUT_LINE: return "line (L2/R2, straight to the boost mixer)";
+    default:         return "off";
+    }
+}
+
+/* The gain actually programmed, which is not what was asked for: both paths
+ * quantise, one to 0.75 dB and the other to 3. */
+static double input_gain_db(void)
+{
+    if (input_path == INPUT_MIC) {
+        double db = PGA_MIN_DB + pga_code * PGA_STEP_DB;
+        return input_boost ? db + 20.0 : db;
+    }
+    if (input_path == INPUT_LINE) {
+        return BOOST_MIN_DB + (line_code - 1) * BOOST_STEP_DB;
+    }
+    return 0.0;
+}
+
 static void nau8822_status(void)
 {
     bp_printf("         I2C 0x%02x, route %s, volume %d%%\n", address,
               route_name(), volume_pct);
+    if (input_path == INPUT_OFF) {
+        bp_printf("         Input off; 'audio nau8822 input mic' or "
+                  "'... input line' powers the ADC\n");
+    } else {
+        bp_printf("         Input %s at %+.2f dB\n", input_name(),
+                  input_gain_db());
+    }
 
     if (readback_works) {
         uint16_t id = 0;
@@ -646,12 +908,160 @@ int cmd_nau8822_route(int argc, char **argv)
         return -1;
     }
 
-    esp_err_t err = apply_route();
+    esp_err_t err = apply_power();
     if (err != ESP_OK) {
         bp_error("Switching the output route: %s", esp_err_to_name(err));
         return -1;
     }
 
     bp_printf("Route %s\n", route_name());
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Capture                                                             */
+/* ------------------------------------------------------------------ */
+
+int cmd_nau8822_input(int argc, char **argv)
+{
+    if (!initialized) {
+        bp_error("The NAU8822 has not been initialized; run "
+                 "'audio nau8822 init' first");
+        return -1;
+    }
+
+    if (argc < 2) {
+        bp_printf("Input %s\n", input_name());
+        if (input_path != INPUT_OFF) {
+            bp_printf("Gain %+.2f dB\n", input_gain_db());
+        }
+        bp_printf("Usage: input <mic|line|off> [boost]\n");
+        return 0;
+    }
+
+    input_t wanted;
+    if (strcasecmp(argv[1], "mic") == 0) {
+        wanted = INPUT_MIC;
+    } else if (strcasecmp(argv[1], "line") == 0) {
+        wanted = INPUT_LINE;
+    } else if (strcasecmp(argv[1], "off") == 0) {
+        wanted = INPUT_OFF;
+    } else {
+        bp_error("Input must be mic, line or off, not '%s'", argv[1]);
+        return -1;
+    }
+
+    bool boost = false;
+    if (argc > 2) {
+        if (strcasecmp(argv[2], "boost") != 0) {
+            bp_error("Unexpected argument '%s'; the only option is 'boost'",
+                     argv[2]);
+            return -1;
+        }
+        if (wanted != INPUT_MIC) {
+            /* The +20 dB stage sits between the PGA and the ADC, and the line
+             * path does not go through it. Silently ignoring the word would
+             * leave the user believing in gain that is not there. */
+            bp_error("'boost' is the +20 dB stage on the microphone path; the "
+                     "line input does not pass through it");
+            bp_printf("Use 'input line' and then 'gain <db>' for up to +3 dB, "
+                      "or 'input mic boost' if the part really is a "
+                      "microphone.\n");
+            return -1;
+        }
+        boost = true;
+    }
+
+    input_t previous = input_path;
+    bool previous_boost = input_boost;
+    input_path = wanted;
+    input_boost = boost;
+
+    esp_err_t err = apply_input();
+    if (err == ESP_OK) {
+        err = apply_power();
+    }
+    if (err != ESP_OK) {
+        input_path = previous;
+        input_boost = previous_boost;
+        bp_error("Switching the input: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    bp_printf("Input %s\n", input_name());
+    if (input_path != INPUT_OFF) {
+        bp_printf("Gain %+.2f dB\n", input_gain_db());
+
+        /*
+         * The ADC now has somewhere to send samples only if the transport was
+         * given a receive line. Worth saying here rather than letting `audio
+         * record` report a dead input on a codec that is working perfectly.
+         */
+        if (audio_bus_rx_mode() != AUDIO_RX_STD) {
+            bp_printf("The I2S bus has no receive line, so nothing will reach "
+                      "'audio record'. Re-run 'audio bus <bclk> <ws> <dout> "
+                      "din <pin> mclk <pin>' with the codec's ADCOUT.\n");
+        }
+    }
+    return 0;
+}
+
+int cmd_nau8822_gain(int argc, char **argv)
+{
+    if (!initialized) {
+        bp_error("The NAU8822 has not been initialized; run "
+                 "'audio nau8822 init' first");
+        return -1;
+    }
+    if (input_path == INPUT_OFF) {
+        bp_error("No input is selected, so there is no gain to set");
+        bp_printf("Run 'audio nau8822 input mic' or '... input line' first.\n");
+        return -1;
+    }
+
+    if (argc < 2) {
+        bp_printf("Gain %+.2f dB on the %s\n", input_gain_db(),
+                  input_path == INPUT_MIC ? "microphone path" : "line path");
+        return 0;
+    }
+
+    double db = 0.0;
+    if (parse_double_arg(argv[1], &db) < 0) {
+        bp_error("Gain must be a number of decibels, not '%s'", argv[1]);
+        return -1;
+    }
+
+    /*
+     * The two paths have different ranges and different step sizes because
+     * they are different amplifiers. Reporting the achieved value rather than
+     * the requested one is the same habit as `gpio pwm set` and `sd spi`.
+     */
+    if (input_path == INPUT_MIC) {
+        double max_db = PGA_MIN_DB + PGA_CODE_MAX * PGA_STEP_DB;
+        if (db < PGA_MIN_DB || db > max_db) {
+            bp_error("The microphone PGA covers %+.2f to %+.2f dB", PGA_MIN_DB,
+                     max_db);
+            bp_printf("The +20 dB boost stage is separate: 'audio nau8822 "
+                      "input mic boost'.\n");
+            return -1;
+        }
+        pga_code = (int)lrint((db - PGA_MIN_DB) / PGA_STEP_DB);
+    } else {
+        double max_db = BOOST_MIN_DB + (BOOST_CODE_MAX - 1) * BOOST_STEP_DB;
+        if (db < BOOST_MIN_DB || db > max_db) {
+            bp_error("The line input covers %+.0f to %+.0f dB in 3 dB steps",
+                     BOOST_MIN_DB, max_db);
+            return -1;
+        }
+        line_code = (int)lrint((db - BOOST_MIN_DB) / BOOST_STEP_DB) + 1;
+    }
+
+    esp_err_t err = apply_input_gain();
+    if (err != ESP_OK) {
+        bp_error("Setting the input gain: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    bp_printf("Gain %+.2f dB\n", input_gain_db());
     return 0;
 }

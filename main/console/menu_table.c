@@ -180,6 +180,8 @@ static const bp_command_t nau8822_commands[] = {
     {"status", "", "Show identity, routing and volume", cmd_nau8822_status},
     {"reg", "<n> [value]", "Read or write a 9-bit register", cmd_nau8822_reg},
     {"route", "<hp|speaker|both>", "Choose which outputs are driven", cmd_nau8822_route},
+    {"input", "<mic|line|off> [boost]", "Choose which input reaches the ADC", cmd_nau8822_input},
+    {"gain", "[db]", "Show or set the analog gain on the selected input", cmd_nau8822_gain},
 };
 
 static const bp_menu_t nau8822_menu = {
