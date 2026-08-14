@@ -11,17 +11,28 @@ running AP and `ap` drops a station association, each saying so as it happens.
 
 ## `scan`
 
-Scans nearby wifi APs and outputs each AP including the RSSI and channel information for each.
+Scans nearby wifi APs and outputs each AP including the SSID, RSSI, channel,
+security and BSSID.
 
 Scanning is a station-mode operation, so it is refused while an access point is
 running; stop it with `wifi ap stop` first.
 
-## `connect <AP> [Password]`
+## `connect <AP> [password] [channel] [bssid]`
 
 Connects to the specified access point.  Connection status and IP address are reported to the user, including any disconnections or changes in the future.
 Disconnect reasons are decoded to readable text. Credentials are stored in NVS,
 so `autostart` rejoins the same network after a reset. Omit the password for an
 open network. A running access point is stopped first.
+
+The channel and BSSID are both optional. Giving the channel hints the driver
+to probe it before falling back to a full scan, connecting faster and more
+reliably. Giving the BSSID (six colon-separated hex octets, copy-pasteable
+straight from `scan` output, e.g. `aa:bb:cc:dd:ee:ff`) pins the association
+to one specific AP -- useful when several APs advertise the same SSID, as on
+a mesh or enterprise network. The SSID is still required even when a BSSID
+is given, since it's part of the WPA key derivation. Because both are
+positional, a BSSID without a channel hint is spelled with an empty channel:
+`wifi connect home mypassword "" aa:bb:cc:dd:ee:ff`.
 
 ## `ap <SSID> [password] [channel]`
 
@@ -69,8 +80,10 @@ promptly. The command can be re-run by hand at any time.
 
 ## `status`
 
-Reports the current association — SSID, BSSID, RSSI, channel, security — plus
-the IP address, gateway and netmask.
+Reports the current association — SSID, BSSID, RSSI, channel, security, the
+negotiated PHY mode (e.g. `802.11b/g/n`) and channel bandwidth (`20 MHz` or
+`40 MHz`), and the configured TX power ceiling — plus the IP address, gateway
+and netmask.
 
 While an access point is running it reports that instead: the SSID, channel,
 security and address being advertised, followed by each connected client with
@@ -78,8 +91,22 @@ its MAC address, DHCP-leased IP and signal strength.
 
 ## `iperf <server>[:<port>]`
 
-Runs an iperf2 TCP test against the specified server, defaulting to port 5001.  Reports back throughput numbers.  Optionally, the user may specify `continuous` which will cause the test to run continually, reporting results every 5 seconds.
+Runs an iperf2 TCP test against the specified server, defaulting to port 5001.
+Before starting the transfer it prints a `Link:` line with the current RSSI,
+PHY mode and bandwidth, so a slow run can be checked against the link it ran
+over. Reports back throughput numbers. Optionally, the user may specify `continuous` which will cause the test to run continually, reporting results every 5 seconds.
 
 A continuous run is ended with `wifi iperf stop`. Because commands are executed
 one at a time, the test runs in the background and the prompt stays usable while
 it reports.
+
+## `netstats`
+
+Reports lwIP's per-layer packet counters — received count, dropped count and
+a summed error count (checksum, length, out-of-memory, routing, protocol and
+option errors combined into one number) — for the link, IP, TCP and UDP
+layers. Counts are cumulative since boot, not since the last command, so read
+`netstats` before and after an `iperf` run and compare: a rising `drop` or
+`err` count during the run points at packet loss or buffer pressure in the
+network stack rather than the radio link (compare against `wifi status`'s
+RSSI/PHY/bandwidth, which cover the radio side).

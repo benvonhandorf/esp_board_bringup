@@ -11,6 +11,7 @@
 
 #include "lwip/inet.h"
 #include "lwip/netdb.h"
+#include "lwip/stats.h"
 
 #include "iperf.h"
 #include "web.h"
@@ -86,6 +87,60 @@ static const char *auth_mode_name(wifi_auth_mode_t mode)
     case WIFI_AUTH_WAPI_PSK:        return "WAPI";
     case WIFI_AUTH_OWE:             return "OWE";
     default:                        return "unknown";
+    }
+}
+
+/* Renders the negotiated PHY mode from a wifi_ap_record_t's bitfields, so a
+ * link stuck on an older/narrower mode than the AP supports is visible at a
+ * glance -- useful when throughput is lower than expected and RF is one of
+ * the suspects. */
+static const char *phy_mode_name(const wifi_ap_record_t *ap)
+{
+    static char name[32];
+    char *p = name;
+    memcpy(p, "802.11", 6);
+    p += 6;
+    bool first = true;
+
+    const struct { bool set; const char *tag; } modes[] = {
+        {ap->phy_11b,  "b"},
+        {ap->phy_11g,  "g"},
+        {ap->phy_11n,  "n"},
+        {ap->phy_11ax, "ax"},
+    };
+
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+        if (!modes[i].set) {
+            continue;
+        }
+        if (!first) {
+            *p++ = '/';
+        }
+        size_t len = strlen(modes[i].tag);
+        memcpy(p, modes[i].tag, len);
+        p += len;
+        first = false;
+    }
+
+    if (first) {
+        return "unknown";
+    }
+
+    if (ap->phy_lr) {
+        memcpy(p, "+LR", 3);
+        p += 3;
+    }
+
+    *p = '\0';
+    return name;
+}
+
+static const char *bandwidth_name(wifi_bandwidth_t bw)
+{
+    switch (bw) {
+    case WIFI_BW20: return "20 MHz";
+    case WIFI_BW40: return "40 MHz";
+    default:        return "unknown";
     }
 }
 
@@ -423,10 +478,29 @@ int cmd_wifi_scan(int argc, char **argv)
     return 0;
 }
 
+/* "aa:bb:cc:dd:ee:ff" -> 6 raw bytes. Returns 0 on success, -1 on any
+ * malformed input (wrong octet count, non-hex, trailing garbage). */
+static int parse_bssid(const char *token, uint8_t bssid[6])
+{
+    unsigned b[6];
+    int consumed = 0;
+
+    if (sscanf(token, "%2x:%2x:%2x:%2x:%2x:%2x%n",
+               &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &consumed) != 6 ||
+        token[consumed] != '\0') {
+        return -1;
+    }
+
+    for (int i = 0; i < 6; i++) {
+        bssid[i] = (uint8_t)b[i];
+    }
+    return 0;
+}
+
 int cmd_wifi_connect(int argc, char **argv)
 {
     if (argc < 2) {
-        bp_printf("Usage: connect <AP> [password]\n");
+        bp_printf("Usage: connect <AP> [password] [channel] [bssid]\n");
         return -1;
     }
 
@@ -449,6 +523,25 @@ int cmd_wifi_connect(int argc, char **argv)
     strlcpy((char *)config.sta.ssid, argv[1], sizeof(config.sta.ssid));
     if (argc > 2) {
         strlcpy((char *)config.sta.password, argv[2], sizeof(config.sta.password));
+    }
+
+    /* An empty channel ("") is how you skip the channel hint but still
+     * reach the bssid argument, matching how `ap` treats an empty password. */
+    if (argc > 3 && argv[3][0] != '\0') {
+        int channel;
+        if (parse_int_arg(argv[3], &channel) < 0 || channel < 1 || channel > 13) {
+            bp_error("Channel must be 1-13");
+            return -1;
+        }
+        config.sta.channel = (uint8_t)channel;
+    }
+
+    if (argc > 4) {
+        if (parse_bssid(argv[4], config.sta.bssid) < 0) {
+            bp_error("BSSID must be six colon-separated hex octets, e.g. aa:bb:cc:dd:ee:ff");
+            return -1;
+        }
+        config.sta.bssid_set = true;
     }
 
     err = esp_wifi_set_config(WIFI_IF_STA, &config);
@@ -637,6 +730,13 @@ int cmd_wifi_status(int argc, char **argv)
     bp_printf("RSSI:     %d dBm\n", ap.rssi);
     bp_printf("Channel:  %d\n", ap.primary);
     bp_printf("Security: %s\n", auth_mode_name(ap.authmode));
+    bp_printf("PHY:      %s\n", phy_mode_name(&ap));
+    bp_printf("Bandwidth: %s\n", bandwidth_name(ap.bandwidth));
+
+    int8_t tx_power = 0;
+    if (esp_wifi_get_max_tx_power(&tx_power) == ESP_OK) {
+        bp_printf("TX power: %d dBm (configured ceiling)\n", tx_power / 4);
+    }
 
     esp_netif_ip_info_t ip;
     if (esp_netif_get_ip_info(sta_netif, &ip) == ESP_OK) {
@@ -644,6 +744,30 @@ int cmd_wifi_status(int argc, char **argv)
         bp_printf("Gateway:  " IPSTR "\n", IP2STR(&ip.gw));
         bp_printf("Netmask:  " IPSTR "\n", IP2STR(&ip.netmask));
     }
+
+    return 0;
+}
+
+/* lwIP splits each layer's errors into six causes; summed into one count to
+ * keep the netstats output as terse as the rest of the wifi menu. */
+static uint32_t proto_errors(const struct stats_proto *s)
+{
+    return s->chkerr + s->lenerr + s->memerr + s->rterr + s->proterr + s->err;
+}
+
+int cmd_wifi_netstats(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    bp_printf("Link:     rx %-8u drop %-6u err %lu\n",
+              lwip_stats.link.recv, lwip_stats.link.drop, (unsigned long)proto_errors(&lwip_stats.link));
+    bp_printf("IP:       rx %-8u drop %-6u err %lu\n",
+              lwip_stats.ip.recv, lwip_stats.ip.drop, (unsigned long)proto_errors(&lwip_stats.ip));
+    bp_printf("TCP:      rx %-8u drop %-6u err %lu\n",
+              lwip_stats.tcp.recv, lwip_stats.tcp.drop, (unsigned long)proto_errors(&lwip_stats.tcp));
+    bp_printf("UDP:      rx %-8u drop %-6u err %lu\n",
+              lwip_stats.udp.recv, lwip_stats.udp.drop, (unsigned long)proto_errors(&lwip_stats.udp));
 
     return 0;
 }
@@ -749,6 +873,9 @@ int cmd_wifi_iperf(int argc, char **argv)
         bp_error("Not associated with an access point");
         return -1;
     }
+
+    bp_printf("Link:     RSSI %d dBm, %s, %s\n",
+              ap.rssi, phy_mode_name(&ap), bandwidth_name(ap.bandwidth));
 
     bool continuous = (argc > 2 && strcasecmp(argv[2], "continuous") == 0);
 

@@ -6,6 +6,7 @@ int cmd_wifi_connect(int argc, char **argv);
 int cmd_wifi_ap(int argc, char **argv);
 int cmd_wifi_status(int argc, char **argv);
 int cmd_wifi_iperf(int argc, char **argv);
+int cmd_wifi_netstats(int argc, char **argv);
 
 /*
  * Join the network stored in NVS, or host an access point when there is none.

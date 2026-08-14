@@ -293,11 +293,12 @@ static const bp_menu_t board_menu = {
 
 static const bp_command_t wifi_commands[] = {
     {"scan", "", "List nearby access points", cmd_wifi_scan},
-    {"connect", "<AP> [password]", "Join an access point", cmd_wifi_connect},
+    {"connect", "<AP> [password] [channel] [bssid]", "Join an access point", cmd_wifi_connect},
     {"ap", "<SSID> [password] [channel]", "Host an access point (or 'ap stop')", cmd_wifi_ap},
     {"autostart", "", "Join the stored network, or host an access point", cmd_wifi_autostart},
     {"status", "", "Show the current association and IP", cmd_wifi_status},
     {"iperf", "<server>[:<port>] [continuous]", "Measure throughput (iperf2 TCP)", cmd_wifi_iperf},
+    {"netstats", "", "Show lwIP protocol drop/error counters", cmd_wifi_netstats},
 };
 
 static const bp_menu_t wifi_menu = {

@@ -335,6 +335,18 @@ which can clock a PDM microphone but has no filter to decode it.
   [`wifi iperf`](wifi.md#iperf-serverport) then loads the radio properly, which
   is as much a power-integrity test as a throughput one: a board that resets or
   browns out here has a supply problem that nothing in stage 1 would show.
+  Both `wifi status` and `wifi iperf` report the negotiated PHY mode and
+  channel bandwidth alongside RSSI: a link stuck on `802.11b` or `20 MHz` when
+  the AP is capable of `n`/`40 MHz` points at RF (distance, interference, AP
+  configuration) as the cause of low throughput. A healthy PHY/RSSI with
+  throughput still below expectations points elsewhere — check
+  [`wifi netstats`](wifi.md#netstats) before and after the run: a rising
+  `drop` or `err` count confirms packet loss or buffer pressure in the
+  network stack rather than the radio. This board's `sdkconfig` currently runs
+  IDF's stock TCP window (`CONFIG_LWIP_TCP_WND_DEFAULT=5760`) and a small
+  AMPDU block-ack window (`CONFIG_ESP_WIFI_TX_BA_WIN=6`), both common
+  throughput ceilings on a link that otherwise looks fine — `netstats` is how
+  to confirm that's actually what's happening rather than guess.
 
 ## Stage 4 — Record what you learned
 

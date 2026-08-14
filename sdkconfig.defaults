@@ -25,3 +25,8 @@ CONFIG_CONSOLE_SORTED_HELP=y
 
 # Needed by the web interface (phase 4) for the command WebSocket.
 CONFIG_HTTPD_WS_SUPPORT=y
+
+# Feeds `wifi netstats`: per-protocol-layer drop/error counters (lwip_stats),
+# used to tell whether low iperf throughput is buffer pressure/packet loss in
+# the network stack rather than a weak RF link.
+CONFIG_LWIP_STATS=y
