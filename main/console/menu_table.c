@@ -18,6 +18,7 @@
 #include "sd.h"
 #include "spi.h"
 #include "system.h"
+#include "touch.h"
 #include "uart.h"
 #include "wifi.h"
 
@@ -291,6 +292,18 @@ static const bp_menu_t board_menu = {
     .submenu_count = ARRAY_COUNT(board_submenus),
 };
 
+static const bp_command_t touch_commands[] = {
+    {"watch", "<pads> [seconds]",
+     "Calibrate touch pads and report all of them, live", cmd_touch_watch},
+};
+
+static const bp_menu_t touch_menu = {
+    .name = "touch",
+    .help = "Capacitive touch pads: calibrate a set and watch them live",
+    .commands = touch_commands,
+    .command_count = ARRAY_COUNT(touch_commands),
+};
+
 static const bp_command_t wifi_commands[] = {
     {"scan", "", "List nearby access points", cmd_wifi_scan},
     {"connect", "<AP> [password] [channel] [bssid]", "Join an access point", cmd_wifi_connect},
@@ -317,6 +330,7 @@ static const bp_menu_t *const root_submenus[] = {
     &spi_menu,
     &sd_menu,
     &audio_menu,
+    &touch_menu,
     &board_menu,
 };
 

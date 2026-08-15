@@ -75,6 +75,22 @@ speaker. `audio bus ... din <dout pin>` is the fallback that always works — th
 I2S driver loops the transmitter back internally, which tests the capture path
 without testing anything outside the chip.
 
+## Capacitive Touch Pads
+
+Take a set of pads, calibrate a baseline for each, then report every pad's
+live reading (not just on/off) so adjacent pads' crosstalk is visible, not
+just whichever pad crossed its own threshold.
+
+**Implemented** as `touch watch <pads> [seconds]` — see
+[docs/touch.md](docs/touch.md). Uses the ESP32-S3's native touch sensor
+peripheral (hardware version 2, GPIO1–14, channel number equals GPIO number);
+compiled out with a clear refusal on the ESP32-C3, which has no touch
+peripheral at all. Distinct from the FT6236 below: this is the SoC's own
+GPIO-pad sensing, not an external I2C touchscreen controller.
+
+Untested against real hardware; there is no touch pad hardware on the bench.
+Builds warning-clean for both `esp32s3` and `esp32c3`.
+
 ## Displays
 
 For displays, run a test pattern over he displays showing different colors and drawing a grid over the display area.

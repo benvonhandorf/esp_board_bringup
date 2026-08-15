@@ -6,3 +6,20 @@
 # the `sd mmc` commands (1-bit and 4-bit SD mode) are compiled in here and
 # compiled out on the C3.
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# PSRAM. Belongs here rather than in the shared sdkconfig.defaults because
+# it's an S3-only peripheral -- the C3 has none, and would silently ignore it
+# either way, but "S3-only" is still what it is.
+#
+# Enabled and set to Octal because the ESP32-S3-DevKitC on the bench has 8MB
+# of embedded Octal PSRAM (confirmed from the boot log: `octal_psram: vendor
+# id : 0x0d (AP)`, 2026-08-14). Not every S3 board carries PSRAM at all,
+# though, and by default IDF treats "enabled at compile time but not found at
+# boot" as a fatal error -- CPU panic, every boot, no way to reach the console
+# to even diagnose it. CONFIG_SPIRAM_IGNORE_NOTFOUND turns that into "boot
+# without it" instead, which is the only sane default when this file is
+# shared across boards that may or may not have the chip fitted (e.g. the
+# Cardputer, whose PSRAM fitment isn't confirmed here).
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_IGNORE_NOTFOUND=y

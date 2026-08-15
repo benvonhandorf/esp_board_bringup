@@ -13,6 +13,7 @@ everywhere — entering and leaving menus, case folding, `help`, the `ERR:` pref
 | [spi](spi.md) | SPI master | |
 | [sd](sd.md) | SD/MMC cards over SPI, 1-bit or 4-bit SD, with speed testing | |
 | [audio](audio.md) | Audio over I2S: tone, sweep, microphone capture and loopback testing | `nau8822`, `ns4168`, `sph0645` |
+| [touch](touch.md) | Capacitive touch pads: calibrate a set and watch them live | |
 | [board](board.md) | Known board pinouts and per-subsystem setup presets | `cardputer`, `xiao` |
 | [system](system.md) | Device information and control | |
 

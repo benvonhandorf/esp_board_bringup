@@ -230,6 +230,17 @@ defaults.
   reading pinned at full scale is reported as saturation, which during bringup
   usually means the bridge is disconnected, unexcited or miswired.
 
+### Capacitive touch pads
+
+Identify the pads, then stimulate and watch the reading move — same rule as
+the I2C sensors above, applied to a whole array at once rather than one part.
+[`touch watch <pads>`](touch.md#watch-pads-seconds) calibrates a baseline for
+every pad given and then reports **all of them, every tick**, which is what
+makes adjacent-pad interference visible: touch one pad and watch whether its
+neighbours' numbers move too, not just whether the one you pressed crosses its
+threshold. ESP32-S3 only — the ESP32-C3 has no touch peripheral, and the
+command says so rather than doing nothing.
+
 ### SD card
 
 Check the pull-ups on the bus with [`gpio rc`](gpio.md#rc-pin-ref-pin-kohms)
@@ -388,6 +399,8 @@ which can clock a PDM microphone but has no filter to decode it.
 | Device answers one address off | Address strap fitted to the wrong side |
 | Device ACKs but data is garbage | Identify it properly — `sht4x serial`, `ina237 config` |
 | SD card never clocks | Bridged pads on the data bus ([`gpio short`](gpio.md#short-pin)) |
+| Touch pad always or never reads active | [`gpio rc`](gpio.md#rc-pin-ref-pin-kohms) to check the net, then [`touch watch`](touch.md#watch-pads-seconds) |
+| Pressing one touch pad also triggers a neighbour | [`touch watch`](touch.md#watch-pads-seconds) with both pads listed — the peak-deflection summary quantifies it |
 | SD works slow, fails fast | [`sd sweep`](sd.md#sweep-max_khz-size_kb-block_kb) — it verifies data, not just errors |
 | Microphone records silence | `audio bus ... din <dout pin>` internal loopback |
 | Microphone records one unchanging value | Wrong data pin, or the part is not clocked |
