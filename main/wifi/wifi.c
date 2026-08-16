@@ -786,15 +786,15 @@ void iperf_report_output(const iperf_report_t *report)
     }
 
     const iperf_traffic_report_t *traffic = &report->traffic;
-    uint32_t seconds = traffic->end_sec - traffic->period_start_sec;
-    double mbits_per_sec = seconds ? (traffic->period_bytes * 8.0) /
-                                     ((double)seconds * 1000000.0)
-                                   : 0.0;
+    unsigned long start_sec = (report->report_type == IPERF_REPORT_SUMMARY) ? 0 : traffic->period_start_sec;
+    uint32_t seconds = traffic->end_sec - start_sec;
+    double bytes = (report->report_type == IPERF_REPORT_SUMMARY) ? traffic->total_transfer_bytes : traffic->period_bytes;
+    double mbits_per_sec = seconds ? (bytes * 8.0) / ((double)seconds * 1000000.0) : 0.0;
 
     bp_printf("%3lu-%3lu sec %12.2f KB %12.2f Mbit/s%s\n",
-              (unsigned long)traffic->period_start_sec,
+              start_sec,
               (unsigned long)traffic->end_sec,
-              traffic->period_bytes / 1024.0,
+              bytes / 1024.0,
               mbits_per_sec,
               report->report_type == IPERF_REPORT_SUMMARY ? "  (total)" : "");
 }

@@ -40,6 +40,9 @@ typedef struct {
     size_t pin_count;
 } board_t;
 
+static int show_pins(const board_t *board);
+static int apply(const board_t *board, const char *const *lines, size_t count);
+
 /* ------------------------------------------------------------------ */
 /* Boards                                                              */
 /* ------------------------------------------------------------------ */
@@ -101,7 +104,117 @@ static const board_t xiao = {
     .pin_count = ARRAY_COUNT(xiao_pins),
 };
 
-static const board_t *const boards[] = {&cardputer, &xiao};
+/** Sensor board */
+static const board_pin_t sensor_pins[] = {
+    {"SD SCK", 40, NULL},
+    {"SD CMD", 41, NULL},
+    {"SD D0", 39, NULL},
+    {"SD D1", 38, NULL},
+    {"SD D2", 44, NULL},
+    {"SD D3", 43, NULL},
+    {"SD DET", 42, NULL},
+    {"I2C SCL", 5, NULL},
+    {"I2C SDA", 4, NULL},
+};
+
+static const board_t sensor = {
+    .name = "sensor",
+    .chip = "esp32c3",
+    .description = "ESP32-C3 based sensor board.  INA237x2, NAU7802, SHT4X, Relay, microSD",
+    .pins = sensor_pins,
+    .pin_count = ARRAY_COUNT(sensor_pins),
+};
+
+/** Minstro board */
+static const board_pin_t minstro_pins[] = {
+    {"SD Card SCK", 40, "SD SCK"},
+    {"SD Card CMD", 41, "SD CMD"},
+
+    {"SD Card D0", 39, "SD D0"},
+    {"SD Card D1", 38, "SD D1"},
+    {"SD Card D2", 44, "SD D2"},
+    {"SD Card D3", 43, "SD D3"},
+    {"I2C SCL", 7, "I2C SCL"},
+    {"I2C SDA", 6, "I2C SDA"},
+    {"I2S MCLK", 8, "I2S MCLK"},
+    {"I2S DOUT", 9, "I2S DOUT"},
+    {"I2S DIN", 10, "I2S DIN"},
+    {"I2S BCLK", 11, "I2S BCLK"},
+    {"I2S FS", 12, "I2S FS"},
+};
+
+static const board_t minstro = {
+    .name = "minstro",
+    .chip = "esp32s3",
+    .description = "Minstro ESP32-S3 board.  I2C, nau8822 codec, 4-bit SD card interface, Display support.",
+    .pins = minstro_pins,
+    .pin_count = ARRAY_COUNT(minstro_pins),
+};
+
+
+static const board_t *const boards[] = {&cardputer, &xiao, &sensor, &minstro};
+
+/* ------------------------------------------------------------------ */
+/* Command functions                                                   */
+/* ------------------------------------------------------------------ */
+
+int cmd_board_sensor_pins(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return show_pins(&sensor);
+}
+
+int cmd_board_sensor_i2c(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    static const char *const lines[] = {
+        "i2c bus 5 4",
+    };
+    return apply(&sensor, lines, ARRAY_COUNT(lines));
+}
+
+int cmd_board_minstro_pins(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return show_pins(&minstro);
+}
+
+int cmd_board_minstro_audio(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    static const char *const lines[] = {
+        "audio bus 8 12 9 din 10 mclk 8",
+    };
+    return apply(&minstro, lines, ARRAY_COUNT(lines));
+}
+
+int cmd_board_minstro_i2c(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    static const char *const lines[] = {
+        "i2c bus 5 4",
+    };
+    return apply(&minstro, lines, ARRAY_COUNT(lines));
+}
+
+int cmd_board_minstro_sd(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    static const char *const lines[] = {
+        "sd mmc 40 41 39 38 44 43",
+    };
+    return apply(&minstro, lines, ARRAY_COUNT(lines));
+}
 
 /* ------------------------------------------------------------------ */
 /* Shared behaviour                                                    */

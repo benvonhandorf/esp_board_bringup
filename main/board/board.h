@@ -27,4 +27,12 @@ int cmd_board_xiao_pins(int argc, char **argv);
 int cmd_board_xiao_sd(int argc, char **argv);
 int cmd_board_xiao_mic(int argc, char **argv);
 
+int cmd_board_sensor_pins(int argc, char **argv);
+int cmd_board_sensor_i2c(int argc, char **argv);
+
+int cmd_board_minstro_pins(int argc, char **argv);
+int cmd_board_minstro_audio(int argc, char **argv);
+int cmd_board_minstro_i2c(int argc, char **argv);
+int cmd_board_minstro_sd(int argc, char **argv);
+
 #endif

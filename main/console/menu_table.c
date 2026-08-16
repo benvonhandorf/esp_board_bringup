@@ -277,11 +277,37 @@ static const bp_menu_t xiao_menu = {
     .command_count = ARRAY_COUNT(xiao_commands),
 };
 
+static const bp_command_t sensor_commands[] = {
+    {"pins", "", "Show the known pinout", cmd_board_sensor_pins},
+    {"i2c", "", "Initialize I2C bus", cmd_board_sensor_i2c},
+};
+
+static const bp_menu_t sensor_menu = {
+    .name = "sensor",
+    .help = "ESP32-C3 sensor board (esp32c3)",
+    .commands = sensor_commands,
+    .command_count = ARRAY_COUNT(sensor_commands),
+};
+
+static const bp_command_t minstro_commands[] = {
+    {"pins", "", "Show the known pinout", cmd_board_minstro_pins},
+    {"audio", "", "Initialize I2S with nau8822 codec", cmd_board_minstro_audio},
+    {"i2c", "", "Initialize I2C bus", cmd_board_minstro_i2c},
+    {"sd", "", "Initialize 4-bit SD card interface", cmd_board_minstro_sd},
+};
+
+static const bp_menu_t minstro_menu = {
+    .name = "minstro",
+    .help = "Minstro ESP32-S3 board (esp32s3)",
+    .commands = minstro_commands,
+    .command_count = ARRAY_COUNT(minstro_commands),
+};
+
 static const bp_command_t board_commands[] = {
     {"list", "", "List the boards this firmware knows", cmd_board_list},
 };
 
-static const bp_menu_t *const board_submenus[] = {&cardputer_menu, &xiao_menu};
+static const bp_menu_t *const board_submenus[] = {&cardputer_menu, &xiao_menu, &sensor_menu, &minstro_menu};
 
 static const bp_menu_t board_menu = {
     .name = "board",
