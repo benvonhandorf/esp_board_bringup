@@ -16,6 +16,8 @@
 
 #define NAU7802_ADDRESS 0x2A
 
+#define ADC_FULL_SCALE (1 << 24)
+
 /* Section 10, Summary Device Register Map. */
 #define REG_PU_CTRL    0x00
 #define REG_CTRL1      0x01
@@ -64,6 +66,7 @@
 #define CTRL2_CAL_ERR      BIT(3)
 #define CTRL2_CRS_SHIFT    4
 #define CTRL2_CRS_MASK     0x70
+#define CTRL2_CHS          BIT(0)
 
 /* CALMOD 00 = internal offset calibration, the one to run at power-up. */
 #define CALMOD_OFFSET_INTERNAL 0x00
@@ -449,6 +452,100 @@ int cmd_nau7802_gain(int argc, char **argv)
     return -1;
 }
 
+int cmd_nau7802_input(int argc, char **argv)
+{
+    if (!require_init()) {
+        return -1;
+    }
+
+    if (argc < 2) {
+        uint8_t ctrl2 = 0;
+        if (read_reg(REG_CTRL2, &ctrl2) != ESP_OK) {
+            bp_error("Reading CTRL2 failed");
+            return -1;
+        }
+        bp_printf("Input channel: %s\n", (ctrl2 & CTRL2_CHS) ? "B" : "A");
+        return 0;
+    }
+
+    if (strcasecmp(argv[1], "a") == 0) {
+        if (update_reg(REG_CTRL2, CTRL2_CHS, 0) != ESP_OK) {
+            bp_error("Switching to input A failed");
+            return -1;
+        }
+        bp_printf("Input channel set to A; re-running internal offset calibration\n");
+        return run_calibration();
+    }
+
+    if (strcasecmp(argv[1], "b") == 0) {
+        if (update_reg(REG_CTRL2, CTRL2_CHS, CTRL2_CHS) != ESP_OK) {
+            bp_error("Switching to input B failed");
+            return -1;
+        }
+        bp_printf("Input channel set to B; re-running internal offset calibration\n");
+        return run_calibration();
+    }
+
+    bp_error("Input must be 'a' or 'b'");
+    return -1;
+}
+
+int cmd_nau7802_raw(int argc, char **argv)
+{
+    if (!require_init()) {
+        return -1;
+    }
+
+    int arg_idx = 1;
+    int samples = 1;
+    if (arg_idx < argc) {
+        if (parse_int_arg(argv[arg_idx], &samples) < 0) {
+            bp_error("Invalid sample count: %s", argv[arg_idx]);
+            return -1;
+        }
+        arg_idx++;
+    }
+
+    const char *channel = "a";
+    if (arg_idx < argc) {
+        if (strcasecmp(argv[arg_idx], "a") != 0 && strcasecmp(argv[arg_idx], "b") != 0) {
+            bp_error("Channel must be 'a' or 'b': %s", argv[arg_idx]);
+            return -1;
+        }
+        channel = argv[arg_idx];
+    }
+
+    if (strcasecmp(channel, "b") == 0) {
+        if (update_reg(REG_CTRL2, CTRL2_CHS, CTRL2_CHS) != ESP_OK) {
+            bp_error("Switching to input B failed");
+            return -1;
+        }
+        run_calibration();
+    } else {
+        if (update_reg(REG_CTRL2, CTRL2_CHS, 0) != ESP_OK) {
+            bp_error("Switching to input A failed");
+            return -1;
+        }
+        run_calibration();
+    }
+
+    bp_printf("Raw ADC readings (channel %s):\n", channel);
+
+    for (int i = 0; i < samples; i++) {
+        int32_t value = 0;
+        esp_err_t err = read_raw(&value);
+        if (err != ESP_OK) {
+            bp_error("Reading sample %d: %s", i + 1, esp_err_to_name(err));
+            return -1;
+        }
+
+        double percent = value * 100.0 / ADC_FULL_SCALE;
+        bp_printf("  %8d  (%.4f%% of full scale)\n", value, percent);
+    }
+
+    return 0;
+}
+
 int cmd_nau7802_rate(int argc, char **argv)
 {
     if (!require_init()) {
@@ -690,6 +787,7 @@ int cmd_nau7802_status(int argc, char **argv)
               ldo_millivolts[(ctrl1 & CTRL1_VLDO_MASK) >> CTRL1_VLDO_SHIFT] / 1000.0);
     bp_printf("CTRL2   0x%02X  %d SPS, calibration %s\n", ctrl2,
               rate, (ctrl2 & CTRL2_CAL_ERR) ? "ERROR" : "ok");
+    bp_printf("Input channel: %s\n", (ctrl2 & CTRL2_CHS) ? "B" : "A");
 
     if (initialized) {
         bp_printf("Tare %ld counts; %s\n", (long)tare_offset,
@@ -699,6 +797,29 @@ int cmd_nau7802_status(int argc, char **argv)
         }
     } else {
         bp_printf("Not initialized by this session; run 'nau7802 init'\n");
+    }
+
+    return 0;
+}
+
+int cmd_nau7802_registers(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    if (!i2c_require_bus()) {
+        return -1;
+    }
+
+    bp_printf("Register dump for NAU7802 at 0x%02X:\n", NAU7802_ADDRESS);
+
+    for (int reg = 0; reg <= 0x0B; reg++) {
+        uint8_t value = 0;
+        if (read_reg(reg, &value) == ESP_OK) {
+            bp_printf("  REG%02X: 0x%02X\n", reg, value);
+        } else {
+            bp_printf("  REG%02X: <error reading>\n", reg);
+        }
     }
 
     return 0;

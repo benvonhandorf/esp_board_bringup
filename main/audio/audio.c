@@ -21,6 +21,9 @@
 #include "driver/gpio.h"
 
 #include <math.h>
+#include <stdio.h>
+#include <unistd.h>
+#include <errno.h>
 
 #define DEFAULT_RATE_HZ  48000
 #define DEFAULT_BITS     16
@@ -846,6 +849,107 @@ int cmd_audio_record(int argc, char **argv)
     audio_capture_spectrum(&cap);
 
     return cap.error == ESP_OK ? 0 : -1;
+}
+
+int cmd_audio_capture_file(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    if (!audio_bus_rx_require()) {
+        return -1;
+    }
+
+    FILE *test = fopen("/sd/.mount_test", "w");
+    if (!test) {
+        bp_error("SD card not mounted at /sd. Run 'sd spi' or 'sd mmc' first.");
+        return -1;
+    }
+    fclose(test);
+    unlink("/sd/.mount_test");
+
+    esp_err_t err = audio_bus_rx_enable(true);
+    if (err != ESP_OK) {
+        bp_error("Starting the receiver: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    audio_capture_flush(0.1);
+
+    const uint32_t sample_rate = 48000;
+    const uint32_t samples_per_file = sample_rate * 10;
+    const size_t frame_bytes = audio_bus_rx_frame_bytes();
+    const size_t block_frames = audio_bus_block_frames();
+    void *buffer = malloc(block_frames * frame_bytes);
+    if (!buffer) {
+        bp_error("Out of memory for capture buffer");
+        return -1;
+    }
+
+    int file_num = 0;
+
+    while (true) {
+        char path[64];
+        snprintf(path, sizeof(path), "/sd/capture%d.pcm", file_num);
+
+        FILE *f = fopen(path, "wb");
+        if (!f) {
+            bp_error("Opening %s: %s", path, strerror(errno));
+            free(buffer);
+            return -1;
+        }
+
+        uint64_t samples_written = 0;
+        int overruns = 0;
+
+        while (samples_written < samples_per_file) {
+            size_t want = block_frames;
+            if (samples_written + want > samples_per_file) {
+                want = (size_t)(samples_per_file - samples_written);
+            }
+
+            size_t got = 0;
+            esp_err_t read_err = audio_bus_read(buffer, want * frame_bytes, &got, 1000);
+            if (read_err != ESP_OK) {
+                bp_error("Read error: %s", esp_err_to_name(read_err));
+                fclose(f);
+                free(buffer);
+                return -1;
+            }
+
+            size_t frames = got / frame_bytes;
+            if (frames == 0) {
+                overruns++;
+                continue;
+            }
+
+            if (fwrite(buffer, frame_bytes, frames, f) != frames) {
+                bp_error("Writing to %s: %s", path, strerror(errno));
+                fclose(f);
+                free(buffer);
+                return -1;
+            }
+
+            samples_written += frames;
+        }
+
+        if (fflush(f) != 0 || fsync(fileno(f)) != 0) {
+            bp_error("Flushing %s: %s", path, strerror(errno));
+            fclose(f);
+            free(buffer);
+            return -1;
+        }
+
+        fclose(f);
+
+        bp_printf("%s: %.1f s, %llu samples, %d overruns\n",
+                  path, 10.0, (unsigned long long)samples_written, overruns);
+
+        file_num++;
+    }
+
+    free(buffer);
+    return 0;
 }
 
 int cmd_audio_level(int argc, char **argv)

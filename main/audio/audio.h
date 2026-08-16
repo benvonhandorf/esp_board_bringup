@@ -322,6 +322,7 @@ double audio_dbfs(double amplitude, double full_scale);
 int cmd_audio_bus(int argc, char **argv);
 int cmd_audio_pdm(int argc, char **argv);
 int cmd_audio_record(int argc, char **argv);
+int cmd_audio_capture_file(int argc, char **argv);
 int cmd_audio_level(int argc, char **argv);
 int cmd_audio_loopback(int argc, char **argv);
 int cmd_audio_info(int argc, char **argv);
