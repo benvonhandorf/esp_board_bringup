@@ -41,5 +41,5 @@ direct_dependencies:
 - espressif/iperf-cmd
 - espressif/mdns
 manifest_hash: e35ad3d9725d2d05065dc4d80a2910d63710f6924d4bf99708d4e5ca6dbe2586
-target: esp32s3
+target: esp32
 version: 3.0.0

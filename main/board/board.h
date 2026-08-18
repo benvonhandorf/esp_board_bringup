@@ -35,4 +35,10 @@ int cmd_board_minstro_audio(int argc, char **argv);
 int cmd_board_minstro_i2c(int argc, char **argv);
 int cmd_board_minstro_sd(int argc, char **argv);
 
+int cmd_board_core_basic_pins(int argc, char **argv);
+int cmd_board_core_basic_audio(int argc, char **argv);
+int cmd_board_core_basic_mic(int argc, char **argv);
+int cmd_board_core_basic_sd(int argc, char **argv);
+int cmd_board_core_basic_i2c(int argc, char **argv);
+
 #endif

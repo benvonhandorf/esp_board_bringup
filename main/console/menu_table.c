@@ -221,7 +221,7 @@ static const bp_command_t audio_commands[] = {
     {"stop", "", "End a continuous tone", cmd_audio_stop},
     {"record", "[seconds]", "Capture the input and report levels and a spectrum",
      cmd_audio_record},
-    {"capture file", "", "Record to sequential SD files at 48 kHz, 10 s rollover",
+    {"capture", "", "[seconds] Record to sequential SD files at 48 kHz, 10 s rollover",
      cmd_audio_capture_file},
     {"level", "[seconds]", "Live input level meter", cmd_audio_level},
     {"loopback", "[hz] [seconds] [level <pct>]",
@@ -308,11 +308,26 @@ static const bp_menu_t minstro_menu = {
     .command_count = ARRAY_COUNT(minstro_commands),
 };
 
+static const bp_command_t core_basic_commands[] = {
+    {"pins", "", "Show the known pinout", cmd_board_core_basic_pins},
+    {"audio", "", "Set up I2S for speaker amplifier", cmd_board_core_basic_audio},
+    {"mic", "", "Set up I2S for microphone capture", cmd_board_core_basic_mic},
+    {"sd", "", "Bring the microSD slot up over SPI", cmd_board_core_basic_sd},
+    {"i2c", "", "Initialize I2C bus", cmd_board_core_basic_i2c},
+};
+
+static const bp_menu_t core_basic_menu = {
+    .name = "core_basic",
+    .help = "M5Stack Core Basic (esp32)",
+    .commands = core_basic_commands,
+    .command_count = ARRAY_COUNT(core_basic_commands),
+};
+
 static const bp_command_t board_commands[] = {
     {"list", "", "List the boards this firmware knows", cmd_board_list},
 };
 
-static const bp_menu_t *const board_submenus[] = {&cardputer_menu, &xiao_menu, &sensor_menu, &minstro_menu};
+static const bp_menu_t *const board_submenus[] = {&cardputer_menu, &xiao_menu, &sensor_menu, &minstro_menu, &core_basic_menu};
 
 static const bp_menu_t board_menu = {
     .name = "board",

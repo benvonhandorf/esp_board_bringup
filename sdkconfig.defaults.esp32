@@ -1,0 +1,20 @@
+# ESP Board Bringup - checked-in project configuration.
+# `sdkconfig` itself is generated (and gitignored); edit this file instead
+# and re-run `idf.py reconfigure` (or delete sdkconfig) to apply.
+#
+# Chip specific settings live in sdkconfig.defaults.<target>, which IDF layers
+# on top of this file. The target below is only the default guess used when no
+# sdkconfig exists yet; `idf.py set-target <chip>` overrides it.
+
+CONFIG_IDF_TARGET="esp32"
+
+# Command line editing / history in the console component.
+CONFIG_CONSOLE_SORTED_HELP=y
+
+# Needed by the web interface (phase 4) for the command WebSocket.
+CONFIG_HTTPD_WS_SUPPORT=y
+
+# Feeds `wifi netstats`: per-protocol-layer drop/error counters (lwip_stats),
+# used to tell whether low iperf throughput is buffer pressure/packet loss in
+# the network stack rather than a weak RF link.
+CONFIG_LWIP_STATS=y

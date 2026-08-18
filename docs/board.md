@@ -43,15 +43,8 @@ missing row is not.
 Runs that subsystem's setup. A preset is refused when the firmware is built for
 a different chip than the board carries.
 
-Currently `cardputer` (M5Stack Cardputer: `pins`, `audio`, `mic`, `sd`) and
-`xiao` (Seeed XIAO ESP32-S3 Sense: `pins`, `mic`, `sd`). The XIAO has no
-speaker, so it has no audio output preset.
+Currently `cardputer` (M5Stack Cardputer: `pins`, `audio`, `mic`, `sd`), `xiao` (Seeed XIAO ESP32-S3 Sense: `pins`, `mic`, `sd`), and `core_basic` (M5Stack Core Basic: `pins`, `audio`, `mic`, `sd`, `i2c`). The XIAO has no speaker, so it has no audio output preset.
 
-**The Cardputer cannot record its own speaker.** GPIO 43 carries the speaker's
-word-select *and* the microphone's clock, so only one of the two can have the
-pad at a time — `board cardputer audio` and `board cardputer mic` are mutually
-exclusive, and `audio loopback` has nothing to work with there. `audio pdm`
-refuses with that explanation rather than letting the second peripheral quietly
-take the pin from the first, which is the failure worth preventing: it is not
-an error but a plausible silence, with the amplifier seeing a megahertz square
-wave where its frame clock used to be.
+**The Cardputer cannot record its own speaker.** GPIO 43 carries the speaker's word-select *and* the microphone's clock, so only one of the two can have the pad at a time — `board cardputer audio` and `board cardputer mic` are mutually exclusive, and `audio loopback` has nothing to work with there. `audio pdm` refuses with that explanation rather than letting the second peripheral quietly take the pin from the first, which is the failure worth preventing: it is not an error but a plausible silence, with the amplifier seeing a megahertz square wave where its frame clock used to be.
+
+**The Core Basic shares GPIO13 between SD CS and speaker DOUT.** This is a board-level design decision: only one subsystem can use the pin at a time. Running `board core_basic sd` and then `board core_basic audio` (or vice versa) will reconfigure the pin for the new purpose.

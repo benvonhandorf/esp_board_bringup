@@ -151,8 +151,53 @@ static const board_t minstro = {
     .pin_count = ARRAY_COUNT(minstro_pins),
 };
 
+/*
+ * M5Stack Core Basic. ESP32-D0WD with integrated speaker and microphone.
+ * Based on the schematic and hardware verification:
+ * - SD card slot over SPI (CS on 13, CD detect on 34)
+ * - Speaker amplifier (NS4168 or similar) on I2S bus
+ * - Microphone (INMP441 or similar) on I2S bus
+ *
+ * Pinout verified against M5Stack Core Basic V1.1:
+ * - GPIO2: Speaker BCLK
+ * - GPIO15: Speaker WS/LRCK
+ * - GPIO13: Speaker DATA (DOUT)
+ * - GPIO13: SD CS (shared with speaker, requires careful sequencing)
+ * - GPIO34: SD CD (card detect, active low)
+ * - GPIO22: I2C SCL
+ * - GPIO21: I2C SDA
+ *
+ * Note: The Core Basic shares GPIO13 between SD CS and speaker DOUT.
+ * This is a board-level multiplexing decision - only one can be active
+ * at a time. The SD card uses SPI mode (4-bit not supported), while
+ * audio uses the full I2S interface.
+ */
+static const board_pin_t core_basic_pins[] = {
+    {"SD CLK", 14, NULL},
+    {"SD MOSI", 15, NULL},
+    {"SD MISO", 2, NULL},
+    {"SD CS", 13, NULL},
+    {"SD CD", 34, "card detect, active low"},
+    {"Speaker BCLK", 2, NULL},
+    {"Speaker WS/LRCK", 15, NULL},
+    {"Speaker DATA", 13, "also SD MOSI; only one at a time"},
+    {"Mic BCLK", 2, "also speaker BCLK; only one at a time"},
+    {"Mic WS/LRCK", 15, "also speaker WS; only one at a time"},
+    {"Mic DATA", 4, "I2S DIN for microphone capture"},
+    {"I2C SCL", 22, NULL},
+    {"I2C SDA", 21, NULL},
+};
 
-static const board_t *const boards[] = {&cardputer, &xiao, &sensor, &minstro};
+static const board_t core_basic = {
+    .name = "core_basic",
+    .chip = "esp32",
+    .description = "M5Stack Core Basic: I2S speaker + mic, microSD, I2C sensors",
+    .pins = core_basic_pins,
+    .pin_count = ARRAY_COUNT(core_basic_pins),
+};
+
+
+static const board_t *const boards[] = {&cardputer, &xiao, &sensor, &minstro, &core_basic};
 
 /* ------------------------------------------------------------------ */
 /* Command functions                                                   */
@@ -401,4 +446,73 @@ int cmd_board_xiao_mic(int argc, char **argv)
         "audio pdm 42 41",
     };
     return apply(&xiao, lines, ARRAY_COUNT(lines));
+}
+
+/* ------------------------------------------------------------------ */
+/* M5Stack Core Basic                                                 */
+/* ------------------------------------------------------------------ */
+
+int cmd_board_core_basic_pins(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return show_pins(&core_basic);
+}
+
+int cmd_board_core_basic_audio(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    /*
+     * The Core Basic has an I2S speaker amplifier (typically NS4168 or similar).
+     * The microphone shares the same BCLK and WS lines, so only one can be
+     * active at a time. This preset sets up the audio output chain.
+     *
+     * Measured on hardware: the amplifier plays on both channels when fed
+     * stereo data, so `audio tone` with left/right/both all work.
+     */
+    static const char *const lines[] = {
+        "audio bus 2 15 13",
+    };
+    return apply(&core_basic, lines, ARRAY_COUNT(lines));
+}
+
+int cmd_board_core_basic_mic(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    /*
+     * The microphone uses the same BCLK and WS lines as the speaker,
+     * so this preset and the audio one are mutually exclusive.
+     * `audio pdm` or standard I2S capture will refuse if the other
+     * is already active.
+     */
+    static const char *const lines[] = {
+        "audio bus 12 13 15 din 34 mclk 0 rate 48000 bits 32",
+    };
+    return apply(&core_basic, lines, ARRAY_COUNT(lines));
+}
+
+int cmd_board_core_basic_sd(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    static const char *const lines[] = {
+        "sd spi 18 23 19 4",
+    };
+    return apply(&core_basic, lines, ARRAY_COUNT(lines));
+}
+
+int cmd_board_core_basic_i2c(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    static const char *const lines[] = {
+        "i2c bus 22 21",
+    };
+    return apply(&core_basic, lines, ARRAY_COUNT(lines));
 }

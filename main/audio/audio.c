@@ -304,7 +304,7 @@ int cmd_audio_bus(int argc, char **argv)
     /*
      * DIN on the same pin as DOUT is not a mistake: the I2S driver turns that
      * into an internal loopback, feeding the transmitter straight back to the
-     * receiver through the pad. It is the one capture test that needs no
+     * receiver through the pad. It is the one   test that needs no
      * hardware at all, which makes it the right first move when a microphone
      * reads silent -- it separates a broken receive path from a broken part.
      */
@@ -651,6 +651,7 @@ int cmd_audio_stop(int argc, char **argv)
 
 #define DEFAULT_RECORD_SECONDS 2.0
 #define DEFAULT_LEVEL_SECONDS  10.0
+#define DEFAULT_CAPTURE_SECONDS 30.0
 #define LEVEL_TICK_SECONDS     0.1
 
 /*
@@ -860,6 +861,11 @@ int cmd_audio_capture_file(int argc, char **argv)
         return -1;
     }
 
+    double seconds = DEFAULT_RECORD_SECONDS;
+    if (take_seconds(argc, argv, 1, &seconds, 60.0) < 0) {
+        return -1;
+    }
+
     FILE *test = fopen("/sd/.mount_test", "w");
     if (!test) {
         bp_error("SD card not mounted at /sd. Run 'sd spi' or 'sd mmc' first.");
@@ -877,6 +883,7 @@ int cmd_audio_capture_file(int argc, char **argv)
     audio_capture_flush(0.1);
 
     const uint32_t sample_rate = 48000;
+    const uint64_t samples_for_capture = sample_rate * seconds;
     const uint32_t samples_per_file = sample_rate * 10;
     const size_t frame_bytes = audio_bus_rx_frame_bytes();
     const size_t block_frames = audio_bus_block_frames();
@@ -887,8 +894,9 @@ int cmd_audio_capture_file(int argc, char **argv)
     }
 
     int file_num = 0;
+    uint64_t samples_captured = 0;
 
-    while (true) {
+    while (samples_captured < samples_for_capture) {
         char path[64];
         snprintf(path, sizeof(path), "/sd/capture%d.pcm", file_num);
 
@@ -931,6 +939,7 @@ int cmd_audio_capture_file(int argc, char **argv)
             }
 
             samples_written += frames;
+            samples_captured += frames;
         }
 
         if (fflush(f) != 0 || fsync(fileno(f)) != 0) {
@@ -949,6 +958,11 @@ int cmd_audio_capture_file(int argc, char **argv)
     }
 
     free(buffer);
+
+    bp_printf("%llu samples, %d files\n",
+            samples_captured, file_num);
+
+
     return 0;
 }
 

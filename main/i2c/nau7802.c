@@ -16,8 +16,6 @@
 
 #define NAU7802_ADDRESS 0x2A
 
-#define ADC_FULL_SCALE (1 << 24)
-
 /* Section 10, Summary Device Register Map. */
 #define REG_PU_CTRL    0x00
 #define REG_CTRL1      0x01
@@ -540,7 +538,7 @@ int cmd_nau7802_raw(int argc, char **argv)
         }
 
         double percent = value * 100.0 / ADC_FULL_SCALE;
-        bp_printf("  %8d  (%.4f%% of full scale)\n", value, percent);
+        bp_printf("  %8ld  (%.4f%% of full scale)\n", value, percent);
     }
 
     return 0;
