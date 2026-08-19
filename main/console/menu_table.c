@@ -104,11 +104,14 @@ static const bp_menu_t sht4x_menu = {
 };
 
 static const bp_command_t nau7802_commands[] = {
-    {"init", "[ldo <volts>]", "Power up, configure and self-calibrate", cmd_nau7802_init},
+    {"init", "[ldo <volts>] [drdy <pin>]", "Power up, configure and self-calibrate", cmd_nau7802_init},
     {"status", "", "Show configuration and calibration state", cmd_nau7802_status},
     {"gain", "[1..128]", "Show or set the PGA gain", cmd_nau7802_gain},
     {"rate", "[10|20|40|80|320]", "Show or set the sample rate in SPS", cmd_nau7802_rate},
     {"input", "[a|b]", "Show or set the input channel", cmd_nau7802_input},
+    {"drdy", "[<pin>|off]", "Show or set the GPIO wired to the DRDY output", cmd_nau7802_drdy},
+    {"ldomode", "[0|1]", "Show or set the regulator loop compensation (AVDD cap ESR)", cmd_nau7802_ldomode},
+    {"pgacap", "[on|off]", "Show or set the PGA output bypass capacitor", cmd_nau7802_pgacap},
     {"raw", "[samples] [a|b]", "Raw ADC readings for diagnostics", cmd_nau7802_raw},
     {"registers", "", "Dump all device registers", cmd_nau7802_registers},
     {"read", "[samples]", "Averaged raw ADC counts", cmd_nau7802_read},
@@ -356,6 +359,8 @@ static const bp_command_t wifi_commands[] = {
     {"ap", "<SSID> [password] [channel]", "Host an access point (or 'ap stop')", cmd_wifi_ap},
     {"autostart", "", "Join the stored network, or host an access point", cmd_wifi_autostart},
     {"status", "", "Show the current association and IP", cmd_wifi_status},
+    {"off", "", "Power the radio down completely, for quiet measurements", cmd_wifi_off},
+    {"on", "", "Power the radio back up and rejoin", cmd_wifi_on},
     {"iperf", "<server>[:<port>] [continuous]", "Measure throughput (iperf2 TCP)", cmd_wifi_iperf},
     {"netstats", "", "Show lwIP protocol drop/error counters", cmd_wifi_netstats},
 };

@@ -66,6 +66,19 @@ static iperf_id_t running_iperf = -1;
  */
 static bool ap_active;
 
+/*
+ * Set by `wifi off`, which stops the driver and with it the PHY. This exists
+ * for measurements rather than for power: an associated radio transmits on its
+ * own schedule, and on a board that shares a supply with an analog front end
+ * that shows up in the readings. Being able to take the radio away and put it
+ * back is what turns "the noise might be WiFi" into an answer.
+ *
+ * It stays off until it is switched back on explicitly. Letting the next
+ * command that wants the radio restart it silently would undo the measurement
+ * being taken, so every such command refuses and names `wifi on` instead.
+ */
+static bool radio_off;
+
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAILED_BIT    BIT1
 
@@ -401,6 +414,20 @@ static int connect_and_wait(const char *ssid, int timeout_ms)
     return -1;
 }
 
+/*
+ * Refuse an operation that needs the radio while it is deliberately off.
+ * Restarting it here instead would silently spoil whatever measurement the
+ * `off` was taken for.
+ */
+static bool require_radio_on(void)
+{
+    if (radio_off) {
+        bp_error("The radio is off. Run 'wifi on' to power it back up.");
+        return false;
+    }
+    return true;
+}
+
 /* Leave AP mode so a station operation can proceed. */
 static esp_err_t leave_ap_mode(void)
 {
@@ -421,6 +448,10 @@ int cmd_wifi_scan(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
+
+    if (!require_radio_on()) {
+        return -1;
+    }
 
     /* The radio can only scan as a station, and AP mode is exclusive. Say so
      * rather than surfacing a bare ESP_ERR_WIFI_MODE. */
@@ -504,6 +535,10 @@ int cmd_wifi_connect(int argc, char **argv)
         return -1;
     }
 
+    if (!require_radio_on()) {
+        return -1;
+    }
+
     esp_err_t err = ensure_wifi_started();
     if (err != ESP_OK) {
         bp_error("Starting WiFi: %s", esp_err_to_name(err));
@@ -558,6 +593,10 @@ int cmd_wifi_ap(int argc, char **argv)
     if (argc < 2) {
         bp_printf("Usage: ap <SSID> [password] [channel]\n");
         bp_printf("       ap stop\n");
+        return -1;
+    }
+
+    if (!require_radio_on()) {
         return -1;
     }
 
@@ -619,10 +658,84 @@ static void default_ap_ssid(char *out, size_t len)
     snprintf(out, len, "esp-bringup-%02x%02x%02x", mac[3], mac[4], mac[5]);
 }
 
+/*
+ * Stop the driver, and with it the PHY: esp_wifi_stop() releases the radio, so
+ * this is a real power-down rather than a disconnect. That distinction is the
+ * whole point -- a station that is merely disassociated still scans, and a
+ * measurement taken against it proves nothing.
+ */
+int cmd_wifi_off(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    if (radio_off) {
+        bp_printf("The radio is already off\n");
+        return 0;
+    }
+
+    if (!wifi_started) {
+        bp_printf("The radio was never started, so it is already off\n");
+        return 0;
+    }
+
+    /* Both depend on the link that is about to disappear. Taking them down
+     * here rather than letting them fail keeps the shutdown quiet, which
+     * matters when the point is to stop activity. */
+    if (running_iperf >= 0) {
+        iperf_stop_instance(running_iperf);
+        running_iperf = -1;
+        bp_printf("Stopped the running iperf measurement\n");
+    }
+    bp_web_stop();
+
+    esp_err_t err = esp_wifi_stop();
+    if (err != ESP_OK) {
+        bp_error("Powering the radio down: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    radio_off = true;
+    ap_active = false;
+
+    bp_printf("Radio off. The web console is down; this serial session is the "
+              "only way back in.\n");
+    return 0;
+}
+
+/* Power the radio back up and rejoin whatever `autostart` would have joined. */
+int cmd_wifi_on(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    if (!radio_off) {
+        bp_printf("The radio is already on\n");
+        return 0;
+    }
+
+    esp_err_t err = esp_wifi_start();
+    if (err != ESP_OK) {
+        bp_error("Powering the radio up: %s", esp_err_to_name(err));
+        return -1;
+    }
+
+    radio_off = false;
+    bp_printf("Radio on\n");
+
+    /* Same path as boot: rejoin the stored network, or raise the access point
+     * if there is none. */
+    return cmd_wifi_autostart(0, NULL);
+}
+
 int cmd_wifi_autostart(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
+
+    if (!require_radio_on()) {
+        return -1;
+    }
 
     esp_err_t err = ensure_wifi_started();
     if (err != ESP_OK) {
@@ -706,6 +819,12 @@ int cmd_wifi_status(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
+
+    if (radio_off) {
+        bp_printf("Radio off (switched off with 'wifi off'). Run 'wifi on' to "
+                  "power it back up.\n");
+        return 0;
+    }
 
     if (!wifi_started) {
         bp_printf("WiFi is not started. Run 'wifi scan' or 'wifi connect' first.\n");
@@ -861,6 +980,10 @@ int cmd_wifi_iperf(int argc, char **argv)
         running_iperf = -1;
         bp_printf("iperf stopped\n");
         return 0;
+    }
+
+    if (!require_radio_on()) {
+        return -1;
     }
 
     if (!wifi_started) {

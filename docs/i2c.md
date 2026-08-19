@@ -104,23 +104,76 @@ address pins, so only one can be present per bus.
 The normal bringup sequence is:
 
 ```
-i2c nau7802 init            # power up, self-calibrate
+i2c nau7802 init drdy 7     # power up, self-calibrate, DRDY on GPIO 7
 i2c nau7802 gain 128        # typical for a load cell's few mV of output
 i2c nau7802 tare            # with the scale empty
 i2c nau7802 calibrate 100   # with a known 100-unit mass on it
 i2c nau7802 weight          # thereafter, in those units
 ```
 
-### `init [ldo <volts>]`
+### `init [ldo <volts>] [drdy <pin>]`
 
 Resets the device, powers up the digital then analog sections, waits for the
-power-up ready flag, and runs the internal offset calibration.
+power-up ready flag, and runs the internal offset calibration. Both options
+describe how the board is wired, so they may be given in either order.
 
 By default AVDD is taken from the pin, which is the chip's own default.
 Boards that rely on the internal regulator — many load cell breakouts do —
 need `init ldo 3.0`. This is not the default deliberately: enabling the
 internal regulator on a board that already drives AVDD would put two sources on
 one net.
+
+`drdy <pin>` names the GPIO the device's DRDY output is wired to; see
+[`drdy`](#drdy-pin-off) below for what it buys you. Without it the driver polls
+the CR status bit over I2C, which works but cannot start the read at a known
+point in the conversion.
+
+### `drdy [<pin>|off]`
+
+Shows or sets the GPIO wired to the device's DRDY output, or releases it with
+`off`. Unlike the other commands this one needs neither `init` nor a bus — it
+is a statement about how the board is wired, so it can be declared or revoked
+without disturbing a converter that is already running.
+
+**What it closes.** The NAU7802 writes its three result registers straight from
+the conversion, with no shadow register and no read latch, and it does not care
+that an I2C transaction is in flight — bus atomicity is not register
+atomicity. A burst read that straddles the moment the device updates those
+registers would return the top byte of one conversion stitched to the low bytes
+of the next.
+
+Without DRDY the driver polls CR on the FreeRTOS tick, so it learns a
+conversion is ready anywhere in a 10–20 ms window after the fact. At 40 SPS and
+above that is a whole conversion period or more, and the read then begins at an
+unknown phase — potentially as the registers are being rewritten. Waiting on
+the pin instead begins the read microseconds after the write, with most of a
+conversion period of margin.
+
+A stitched read has a distinctive signature: near zero the result alternates
+between `0x0000xx` and `0xFFFFxx`, so the top byte comes from the wrong sample
+and the value lands about ±65,500 away from its neighbours. **That signature
+has never been observed on the sensor board** — runs of 250 samples at gain 1,
+where the signal straddles zero and the top byte flips 40–60 times, produced
+zero such outliers with polling or with DRDY. Treat this as a window that is
+closed on principle, not as an explanation for a noisy reading; if readings are
+noisy, the cause is somewhere else.
+
+A wrong pin number fails cleanly rather than quietly: the input is pulled down,
+so a pin that is not connected to DRDY reads low, times out, and says so. A
+floating input left to sit high would instead look permanently ready and
+return bad numbers.
+
+```
+i2c nau7802 drdy 7          # declare it
+i2c nau7802 drdy            # show it, and the line's level right now
+i2c nau7802 drdy off        # back to polling over I2C
+```
+
+One read still carries the old timing risk: if DRDY is already high when a
+measurement starts, a result is sitting unread and there is no edge coming —
+DRDY does not fall until the result is read — so the driver takes it at an
+unknown phase. That can only be the first sample of a batch, since reading a
+result drops the line and re-arms the edge for every sample after it.
 
 ### `status`
 
@@ -136,6 +189,8 @@ PU_CTRL 0xBE  digital up, analog up, ready yes, data ready
 AVDD source: internal LDO
 CTRL1   0x2F  gain x128, LDO 3.0 V
 CTRL2   0x00  10 SPS, calibration ok
+Input channel: A
+Data ready: DRDY on GPIO 7, now low
 Tare 8421 counts; calibrated
 Scale 214.7 counts per unit
 ```
@@ -172,6 +227,43 @@ swinging across most of the full-scale range.
 values spanning the entire range regardless of calibration, while 10–80 SPS are
 rock steady; the likely cause is that 320 SPS needs an external crystal rather
 than the internal RC oscillator. The command warns when you select it.
+
+### `ldomode [0|1]`
+
+Shows or sets `REG0x1B[6]`, which picks the compensation for the internal
+regulator's control loop. It has to match the capacitor the board fits on AVDD:
+
+| | AVDD capacitor | trade |
+|---|---|---|
+| `0` (chip default) | ESR **below 1 Ω** | better DC accuracy, higher loop gain |
+| `1` | ESR **up to 5 Ω** | more stable loop, lower DC gain |
+
+Pin 16's description in the data sheet asks for "low ESR 1 ohm or less" because
+that is what the default expects. A board fitting something with more ESR than
+that and leaving this bit alone runs a marginally compensated regulator, which
+would be a broadband noise source on the supply and the reference — after the
+PGA, where no amount of gain or input rewiring reaches it.
+
+Worth checking on an unfamiliar board; on the sensor board it makes no
+measurable difference, so whatever is on AVDD there is comfortably inside the
+default's 1 Ω.
+
+Changing it re-runs the internal offset calibration, since the two modes settle
+AVDD — the reference — at slightly different levels.
+
+### `pgacap [on|off]`
+
+Shows or sets `REG0x1C[7]`, which connects a filter capacitor across the
+VIN2P/VIN2N pins to the PGA output. The data sheet offers it "for enhanced ENOB
+at high PGA gain settings".
+
+Two things it needs. The capacitor has to be physically fitted — **330 pF at
+AVDD 3.3 V, 680 pF at 4.5 V** — and with none there this bit changes nothing at
+all. And it consumes channel 2, whose pins become the filter node, so `input b`
+after enabling it reads the capacitor rather than an input.
+
+On the sensor board it changes nothing, which is the expected result for a
+board with no such capacitor fitted.
 
 ### `read [samples]`, `tare [samples]`, `calibrate <known mass> [samples]`, `weight [samples]`
 

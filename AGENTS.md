@@ -223,6 +223,34 @@ and not project-wide.
 - **I2C device handles are cached** per address in `i2c.c`. Drivers
   (`ina237.c`, `sht4x.c`, `nau7802.c`) call `i2c_require_bus()` and
   `i2c_device_handle()` rather than opening their own bus.
+- **The NAU7802's result registers tear.** There is no shadow register and no
+  read latch, and the converter rewrites all three bytes at end-of-conversion
+  regardless of an I2C transaction in flight — a single burst read is atomic on
+  the *bus*, not against the *device*. A read straddling that moment returns one
+  conversion's top byte on the next one's low bytes. Near zero, where the code
+  alternates between `0x0000xx` and `0xFFFFxx`, that is a ±65,500 outlier on an
+  input that is not moving; anywhere else it passes for noise. `drdy <pin>`
+  waits on the device's own ready line so the read starts microseconds after the
+  registers are written; without it the CR poll runs on the tick and begins the
+  read at an unknown phase.
+- **The NAU7802's noise floor on the sensor board is ~3400 counts RMS at
+  10 SPS** (~13 effective bits of 24) and nothing reachable from firmware moves
+  it. Ruled out by measurement: torn reads, input wiring, WiFi, the ADC clock
+  (noise scales as sqrt(rate), as white noise should), LDO voltage, `LDOMODE`
+  (REG0x1B[6], the AVDD capacitor ESR compensation) and `PGA_CAP_EN`
+  (REG0x1C[7]). Do not re-run these; the remaining suspects are on the board.
+- **`init` without `ldo` on the sensor board is a dead converter, not a quiet
+  one.** AVDD is not externally driven there, so the analog section has no
+  supply: the output reads 0 +/- 1 identically at gain 1, 32 and 128, and the
+  offset calibration returns zero. A spread of 3 counts at gain 32 is better
+  than the data sheet's best case, which is the tell.
+- **`CTRL2.CHS` is bit 7, not bit 0.** Bit 0 is `CALMOD[0]`, so getting this
+  wrong selects a calibration mode instead of a channel, `run_calibration()`
+  clears it again, and every reading comes from channel 1 while `input` and
+  `status` agree with each other that the channel changed. A wrong bit position
+  in a register whose other fields are write-then-clear fails without any error
+  at all; check bit numbering against the register map, not against the
+  read-back.
 - **The console must be the chip's PRIMARY serial device.** On USB-Serial-JTAG
   boards (`/dev/ttyACM*`) that means `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`; a
   secondary console is output-only and would never receive keystrokes.
@@ -232,6 +260,13 @@ and not project-wide.
   is idempotent because both paths can fire in one session. It registers an
   output sink; `httpd_ws_send_frame_async()` must run on the HTTP task, so the
   sink hands chunks over with `httpd_queue_work()`.
+- **`wifi off` stops the driver, not just the association.** It exists so the
+  radio can be ruled in or out as a noise source on a board that shares a
+  supply with an analog front end. It stays off until `wifi on`: commands
+  needing the radio refuse and name the way back rather than restarting it,
+  because silently powering it up would spoil the measurement the `off` was
+  taken for. Used against the NAU7802 it cleared the radio — the noise there is
+  the same with the radio stopped.
 - **Station and AP mode are exclusive** in `wifi.c` — `WIFI_MODE_STA` or
   `WIFI_MODE_AP`, never `APSTA`, because one radio cannot hold two channels and
   an APSTA setup silently drags the AP onto the station's channel. `connect`,

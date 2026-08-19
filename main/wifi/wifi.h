@@ -9,6 +9,14 @@ int cmd_wifi_iperf(int argc, char **argv);
 int cmd_wifi_netstats(int argc, char **argv);
 
 /*
+ * Power the radio down and back up. `off` stops the driver and the PHY, so a
+ * measurement taken with it off is taken with the radio genuinely silent; it
+ * stays off until `on`, which also rejoins the stored network.
+ */
+int cmd_wifi_off(int argc, char **argv);
+int cmd_wifi_on(int argc, char **argv);
+
+/*
  * Join the network stored in NVS, or host an access point when there is none.
  *
  * Queued by app_main() at boot so the web console is reachable without a serial

@@ -89,6 +89,38 @@ While an access point is running it reports that instead: the SSID, channel,
 security and address being advertised, followed by each connected client with
 its MAC address, DHCP-leased IP and signal strength.
 
+## `off` and `on`
+
+`off` powers the radio down: it stops the WiFi driver, and with it the PHY.
+This is a real power-down rather than a disconnect — a station that has merely
+disassociated still scans and still transmits, so a measurement taken against
+one proves nothing.
+
+The point is measurement, not power saving. On a board that shares a supply
+between the radio and an analog front end, the radio is a suspect whenever a
+reading is noisier than the part's datasheet says it should be, and the only
+way to convict or clear it is to take it away and look again:
+
+```
+i2c nau7802 read 50         # with the radio up
+wifi off
+i2c nau7802 read 50         # with it genuinely silent
+wifi on
+```
+
+The radio stays off until `on`. Commands that need it — `scan`, `connect`,
+`ap`, `autostart`, `iperf` — refuse while it is off and name `wifi on` rather
+than restarting it themselves, because silently powering the radio back up
+would spoil the measurement the `off` was taken for. `status` reports the off
+state instead of refusing.
+
+**`off` takes the web console down with it**, since the address it is bound to
+goes away. A serial session is the only way back in, which is worth knowing
+before running it over the web console.
+
+`on` powers the radio up and then does exactly what [`autostart`](#autostart)
+does: rejoin the stored network, or raise the access point if there is none.
+
 ## `iperf <server>[:<port>]`
 
 Runs an iperf2 TCP test against the specified server, defaulting to port 5001.
